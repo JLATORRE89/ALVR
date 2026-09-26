@@ -10,7 +10,7 @@ use alvr_common::{
     DETACHED_CONTROLLER_LEFT_ID, DETACHED_CONTROLLER_RIGHT_ID, HAND_LEFT_ID, HAND_RIGHT_ID,
     HEAD_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::Result,
-    error,
+    error, info,
     glam::{UVec2, Vec2},
     parking_lot::RwLock,
 };
@@ -302,6 +302,7 @@ impl StreamContext {
     }
 
     pub fn maybe_initialize_decoder(&mut self, codec: CodecType, config_nal: Vec<u8>) {
+        info!("[INTEL-XR-VIDEO] DECODER_CREATE_BEGIN codec={codec:?} config_bytes={}", config_nal.len());
         let new_config = VideoDecoderConfig {
             codec,
             force_software_decoder: self.config.force_software_decoder,
@@ -325,10 +326,17 @@ impl StreamContext {
                     Err(e) => ctx.report_fatal_decoder_error(&e.to_string()),
                 }
             });
+            info!("[INTEL-XR-VIDEO] DECODER_CREATED");
             self.decoder = Some((config, source));
 
             self.core_context.set_decoder_input_callback(Box::new(
-                move |timestamp, buffer| -> bool { sink.push_nal(timestamp, buffer) },
+                move |timestamp, buffer| -> bool {
+                    let accepted = sink.push_nal(timestamp, buffer);
+                    if accepted {
+                        info!("[INTEL-XR-VIDEO] DECODER_INPUT bytes={} timestamp_ns={}", buffer.len(), timestamp.as_nanos());
+                    }
+                    accepted
+                },
             ));
         }
     }
@@ -358,6 +366,7 @@ impl StreamContext {
 
         let (timestamp, view_params, buffer_ptr) =
             if let Some((timestamp, buffer_ptr)) = frame_result {
+                info!("[INTEL-XR-VIDEO] DECODER_OUTPUT timestamp_ns={} buffer={buffer_ptr:p}", timestamp.as_nanos());
                 let view_params = self.core_context.report_compositor_start(timestamp);
 
                 self.last_good_view_params = view_params;
@@ -421,6 +430,11 @@ impl StreamContext {
             openxr_display_time = vsync_time;
         }
 
+        if buffer_ptr.is_null() {
+            info!("[INTEL-XR-VIDEO] STREAM_RENDER no_decoded_frame");
+        } else {
+            info!("[INTEL-XR-VIDEO] STREAM_RENDER decoded_frame");
+        }
         self.renderer.render(
             buffer_ptr,
             [
