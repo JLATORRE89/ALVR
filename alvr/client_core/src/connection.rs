@@ -267,14 +267,25 @@ fn connection_pipeline(
     info!("Connected to server");
     info!("[INTEL-XR-VIDEO] STREAM_SOCKET_CONNECTED");
 
+    info!("[INTEL-XR-VIDEO] SUBSCRIBE_VIDEO_BEGIN");
     let mut video_receiver =
         stream_socket.subscribe_to_stream::<VideoPacketHeader>(VIDEO, MAX_UNREAD_PACKETS);
+    info!("[INTEL-XR-VIDEO] SUBSCRIBE_VIDEO_OK");
+    info!("[INTEL-XR-VIDEO] SUBSCRIBE_AUDIO_BEGIN");
     let mut game_audio_receiver = stream_socket.subscribe_to_stream(AUDIO, MAX_UNREAD_PACKETS);
+    info!("[INTEL-XR-VIDEO] SUBSCRIBE_AUDIO_OK");
+    info!("[INTEL-XR-VIDEO] TRACKING_STREAM_BEGIN");
     let tracking_sender = stream_socket.request_stream(TRACKING);
+    info!("[INTEL-XR-VIDEO] TRACKING_STREAM_OK");
+    info!("[INTEL-XR-VIDEO] SUBSCRIBE_HAPTICS_BEGIN");
     let mut haptics_receiver =
         stream_socket.subscribe_to_stream::<Haptics>(HAPTICS, MAX_UNREAD_PACKETS);
+    info!("[INTEL-XR-VIDEO] SUBSCRIBE_HAPTICS_OK");
+    info!("[INTEL-XR-VIDEO] STATISTICS_STREAM_BEGIN");
     let statistics_sender = stream_socket.request_stream(STATISTICS);
+    info!("[INTEL-XR-VIDEO] STATISTICS_STREAM_OK");
 
+    info!("[INTEL-XR-VIDEO] VIDEO_THREAD_SPAWN_BEGIN");
     let video_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         move || {
@@ -353,8 +364,13 @@ fn connection_pipeline(
         }
     });
 
+    info!("[INTEL-XR-VIDEO] VIDEO_THREAD_SPAWNED");
+    info!("[INTEL-XR-VIDEO] AUDIO_INIT_BEGIN enabled={}", matches!(settings.audio.game_audio, Switch::Enabled(_)));
     let game_audio_thread = if let Switch::Enabled(config) = settings.audio.game_audio {
-        let device = alvr_audio::new_output(None).to_con()?;
+        let device = match alvr_audio::new_output(None).to_con() {
+            Ok(device) => { info!("[INTEL-XR-VIDEO] AUDIO_DEVICE_OK"); device },
+            Err(e) => { error!("[INTEL-XR-VIDEO] AUDIO_DEVICE_FAILED {e}"); return Err(e); }
+        };
         thread::spawn({
             let ctx = Arc::clone(&ctx);
             move || {
@@ -374,6 +390,8 @@ fn connection_pipeline(
         thread::spawn(|| ())
     };
 
+    info!("[INTEL-XR-VIDEO] AUDIO_THREAD_READY");
+    info!("[INTEL-XR-VIDEO] MICROPHONE_INIT_BEGIN enabled={}", matches!(settings.audio.microphone, Switch::Enabled(_)));
     let microphone_thread = if matches!(settings.audio.microphone, Switch::Enabled(_)) {
         let device = alvr_audio::new_input(None).to_con()?;
 
@@ -405,6 +423,8 @@ fn connection_pipeline(
         thread::spawn(|| ())
     };
 
+    info!("[INTEL-XR-VIDEO] MICROPHONE_THREAD_READY");
+    info!("[INTEL-XR-VIDEO] HAPTICS_THREAD_SPAWN_BEGIN");
     let haptics_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         let event_queue = Arc::clone(&event_queue);
@@ -429,8 +449,11 @@ fn connection_pipeline(
         }
     });
 
+    info!("[INTEL-XR-VIDEO] HAPTICS_THREAD_SPAWNED");
     let (log_channel_sender, log_channel_receiver) = mpsc::channel();
+    info!("[INTEL-XR-VIDEO] LOG_CHANNEL_READY");
 
+    info!("[INTEL-XR-VIDEO] CONTROL_SEND_THREAD_SPAWN_BEGIN");
     let control_send_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         let event_queue = Arc::clone(&event_queue);
@@ -481,6 +504,8 @@ fn connection_pipeline(
         }
     });
 
+    info!("[INTEL-XR-VIDEO] CONTROL_SEND_THREAD_SPAWNED");
+    info!("[INTEL-XR-VIDEO] CONTROL_RECEIVE_THREAD_SPAWN_BEGIN");
     let control_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         let event_queue = Arc::clone(&event_queue);
@@ -538,6 +563,8 @@ fn connection_pipeline(
         }
     });
 
+    info!("[INTEL-XR-VIDEO] CONTROL_RECEIVE_THREAD_SPAWNED");
+    info!("[INTEL-XR-VIDEO] STREAM_RECEIVE_THREAD_SPAWN_BEGIN");
     let stream_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         let event_queue = Arc::clone(&event_queue);
@@ -557,6 +584,8 @@ fn connection_pipeline(
         }
     });
 
+    info!("[INTEL-XR-VIDEO] STREAM_RECEIVE_THREAD_SPAWNED");
+    info!("[INTEL-XR-VIDEO] INSTALL_SENDERS_BEGIN");
     *ctx.control_sender.lock() = Some(control_sender);
     *ctx.tracking_sender.lock() = Some(tracking_sender);
     *ctx.statistics_sender.lock() = Some(statistics_sender);
@@ -567,6 +596,7 @@ fn connection_pipeline(
             debug_groups_config: settings.extra.logging.debug_groups,
         });
     }
+    info!("[INTEL-XR-VIDEO] INSTALL_SENDERS_OK");
     event_queue.lock().push_back(streaming_start_event);
     info!("[INTEL-XR-VIDEO] STREAMING_EVENT_QUEUED");
 
