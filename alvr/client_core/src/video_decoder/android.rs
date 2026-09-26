@@ -69,6 +69,7 @@ impl VideoDecoderSink {
                 // complete precision, so when converted back to Duration it can compare correctly
                 // to other Durations
                 decoder.queue_input_buffer(buffer, 0, data.len(), timestamp.as_nanos() as _, 0)?;
+                info!("[INTEL-XR-VIDEO] MEDIACODEC_INPUT bytes={} timestamp_ns={}", data.len(), timestamp.as_nanos());
 
                 Ok(true)
             }
@@ -160,6 +161,7 @@ fn decoder_attempt_setup(
     format: &MediaFormat,
     image_reader: &ImageReader,
 ) -> Result<MediaCodec> {
+    info!("[INTEL-XR-VIDEO] MEDIACODEC_CREATE codec={codec_type:?} software={is_software}");
     let decoder = if is_software {
         let sw_codec_name = match codec_type {
             CodecType::H264 => "OMX.google.h264.decoder",
@@ -173,6 +175,7 @@ fn decoder_attempt_setup(
         MediaCodec::from_decoder_type(&mime)
             .ok_or(anyhow!("unable to find decoder for mime type: {}", &mime))?
     };
+    info!("[INTEL-XR-VIDEO] MEDIACODEC_CONFIGURE_BEGIN software={is_software}");
     decoder
         .configure(
             &format,
@@ -180,10 +183,12 @@ fn decoder_attempt_setup(
             MediaCodecDirection::Decoder,
         )
         .with_context(|| format!("failed to configure decoder"))?;
+    info!("[INTEL-XR-VIDEO] MEDIACODEC_CONFIGURED software={is_software}");
 
     decoder
         .start()
         .with_context(|| format!("failed to start decoder"))?;
+    info!("[INTEL-XR-VIDEO] MEDIACODEC_STARTED software={is_software}");
 
     Ok(decoder)
 }
@@ -221,6 +226,7 @@ fn decoder_lifecycle(
                         callback(Ok(timestamp));
                     }
 
+                    info!("[INTEL-XR-VIDEO] IMAGE_READER_FRAME timestamp_ns={}", timestamp.as_nanos());
                     image_queue_lock.push_back(QueuedImage {
                         timestamp,
                         image,
@@ -312,6 +318,7 @@ fn decoder_lifecycle(
     while running.value() {
         match decoder.dequeue_output_buffer(Duration::from_millis(1)) {
             Ok(DequeuedOutputBufferInfoResult::Buffer(buffer)) => {
+                info!("[INTEL-XR-VIDEO] MEDIACODEC_OUTPUT");
                 // The buffer timestamp is actually nanoseconds
                 let presentation_time_ns = buffer.info().presentation_time_us();
 
