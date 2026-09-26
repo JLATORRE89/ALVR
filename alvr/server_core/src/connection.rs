@@ -870,6 +870,7 @@ fn connection_pipeline(
         let ctx = Arc::clone(&ctx);
         let client_hostname = client_hostname.clone();
         move || {
+            let mut intel_xr_video_packet_sent_logged = false;
             while is_streaming(&client_hostname) {
                 let VideoPacket {
                     mut header,
@@ -889,7 +890,15 @@ fn connection_pipeline(
                 buffer
                     .get_range_mut(0, payload.len())
                     .copy_from_slice(&payload);
-                video_sender.send(buffer).ok();
+                let payload_len = payload.len();
+                let is_idr = header.is_idr;
+                if video_sender.send(buffer).is_ok() && !intel_xr_video_packet_sent_logged {
+                    info!(
+                        "[INTEL-XR-SERVER] VIDEO_PACKET_SENT bytes={} idr={}",
+                        payload_len, is_idr
+                    );
+                    intel_xr_video_packet_sent_logged = true;
+                }
             }
         }
     });
@@ -1225,10 +1234,20 @@ fn connection_pipeline(
                     }
                     ClientControlPacket::RequestIdr => {
                         if let Some(config) = ctx.decoder_config.lock().clone() {
-                            control_sender
+                            let codec = config.codec;
+                            let config_bytes = config.config_buffer.len();
+                            if control_sender
                                 .lock()
                                 .send(&ServerControlPacket::DecoderConfig(config))
-                                .ok();
+                                .is_ok()
+                            {
+                                info!(
+                                    "[INTEL-XR-SERVER] DECODER_CONFIG_SENT codec={:?} bytes={}",
+                                    codec, config_bytes
+                                );
+                            }
+                        } else {
+                            info!("[INTEL-XR-SERVER] DECODER_CONFIG_UNAVAILABLE_ON_IDR_REQUEST");
                         }
                         ctx.events_sender.send(ServerCoreEvent::RequestIDR).ok();
                     }
