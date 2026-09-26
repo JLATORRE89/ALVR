@@ -232,7 +232,7 @@ pub fn entry_point() {
 
     let graphics_context = Rc::new(GraphicsContext::new_gl());
 
-    let mut last_lobby_message = String::new();
+    let mut last_lobby_message = String::from("INTEL XR DIAGNOSTIC\n01 CLIENT STARTED");
 
     'session_loop: loop {
         let xr_system = xr_instance
@@ -344,8 +344,17 @@ pub fn entry_point() {
                     xr::Event::EventsLost(event) => {
                         error!("OpenXR: lost {} events!", event.lost_event_count());
                     }
-                    xr::Event::InstanceLossPending(_) => break 'session_loop,
-                    xr::Event::SessionStateChanged(event) => match event.state() {
+                    xr::Event::InstanceLossPending(_) => {
+                        info!("[INTEL-XR-LIFECYCLE] INSTANCE_LOSS_PENDING");
+                        break 'session_loop;
+                    },
+                    xr::Event::SessionStateChanged(event) => {
+                        let state = event.state();
+                        info!("[INTEL-XR-LIFECYCLE] OPENXR_STATE {state:?}");
+                        let hud = format!("INTEL XR DIAGNOSTIC\nOPENXR {state:?}");
+                        last_lobby_message.clone_from(&hud);
+                        lobby.update_hud_message(&hud);
+                        match state {
                         xr::SessionState::READY => {
                             xr_session
                                 .begin(xr::ViewConfigurationType::PRIMARY_STEREO)
@@ -370,6 +379,7 @@ pub fn entry_point() {
                             break 'render_loop;
                         }
                         _ => (),
+                        }
                     },
                     xr::Event::ReferenceSpaceChangePending(event) => {
                         info!(
@@ -418,6 +428,9 @@ pub fn entry_point() {
                         lobby.update_hud_message(&message);
                     }
                     ClientCoreEvent::StreamingStarted(config) => {
+                        info!("[INTEL-XR-VIDEO] STREAMING_STARTED");
+                        last_lobby_message = String::from("INTEL XR DIAGNOSTIC\n04 STREAM STARTED");
+                        lobby.update_hud_message(&last_lobby_message);
                         let config = ParsedStreamConfig::new(&config);
 
                         let context = StreamContext::new(
@@ -437,6 +450,9 @@ pub fn entry_point() {
                         core_context.send_proximity_state(headset_is_worn);
                     }
                     ClientCoreEvent::StreamingStopped => {
+                        info!("[INTEL-XR-VIDEO] STREAMING_STOPPED");
+                        last_lobby_message = String::from("INTEL XR DIAGNOSTIC\nSTREAM STOPPED");
+                        lobby.update_hud_message(&last_lobby_message);
                         if passthrough_layer.is_none() {
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
                         }
@@ -469,6 +485,9 @@ pub fn entry_point() {
                             .unwrap();
                     }
                     ClientCoreEvent::DecoderConfig { codec, config_nal } => {
+                        info!("[INTEL-XR-VIDEO] DECODER_CONFIG codec={codec:?} bytes={}", config_nal.len());
+                        last_lobby_message = format!("INTEL XR DIAGNOSTIC\n05 DECODER CONFIG\n{codec:?} {} bytes", config_nal.len());
+                        lobby.update_hud_message(&last_lobby_message);
                         if let Some(stream) = &mut stream_context {
                             stream.maybe_initialize_decoder(codec, config_nal);
                         }
