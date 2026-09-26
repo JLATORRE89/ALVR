@@ -190,6 +190,7 @@ fn connection_pipeline(
     let config_packet =
         proto_control_socket.recv::<StreamConfigPacket>(HANDSHAKE_ACTION_TIMEOUT)?;
     dbg_connection!("connection_pipeline: stream config received");
+    info!("[INTEL-XR-VIDEO] STREAM_CONFIG_RECEIVED");
 
     let stream_config = config_packet.to_stream_config().to_con()?;
 
@@ -211,6 +212,7 @@ fn connection_pipeline(
     match control_receiver.recv(HANDSHAKE_ACTION_TIMEOUT) {
         Ok(ServerControlPacket::StartStream) => {
             info!("Stream starting");
+            info!("[INTEL-XR-VIDEO] START_STREAM_RECEIVED");
             set_hud_message(&event_queue, STREAM_STARTING_MESSAGE);
         }
         Ok(ServerControlPacket::Restarting) => {
@@ -263,6 +265,7 @@ fn connection_pipeline(
     )?;
 
     info!("Connected to server");
+    info!("[INTEL-XR-VIDEO] STREAM_SOCKET_CONNECTED");
 
     let mut video_receiver =
         stream_socket.subscribe_to_stream::<VideoPacketHeader>(VIDEO, MAX_UNREAD_PACKETS);
@@ -283,14 +286,17 @@ fn connection_pipeline(
                     Err(ConnectionError::Other(_)) => return,
                 };
                 let Ok((header, nal)) = data.get() else {
+                    error!("[INTEL-XR-VIDEO] VIDEO_PACKET_PARSE_FAILED");
                     return;
                 };
+                info!("[INTEL-XR-VIDEO] VIDEO_PACKET_RECEIVED bytes={} idr={} loss={}", nal.len(), header.is_idr, data.had_packet_loss());
 
                 if let Some(stats) = &mut *ctx.statistics_manager.lock() {
                     stats.report_video_packet_received(header.timestamp);
                 }
 
                 if header.is_idr {
+                    info!("[INTEL-XR-VIDEO] IDR_RECEIVED bytes={}", nal.len());
                     stream_corrupted = false;
                 } else if data.had_packet_loss() {
                     stream_corrupted = true;
@@ -315,11 +321,13 @@ fn connection_pipeline(
                         }
                     }
 
-                    let submitted = ctx
-                        .decoder_callback
-                        .lock()
+                    let mut callback_lock = ctx.decoder_callback.lock();
+                    let callback_present = callback_lock.is_some();
+                    info!("[INTEL-XR-VIDEO] DECODER_CALLBACK present={callback_present}");
+                    let submitted = callback_lock
                         .as_mut()
                         .is_some_and(|callback| callback(header.timestamp, nal));
+                    info!("[INTEL-XR-VIDEO] DECODER_SUBMIT accepted={submitted} bytes={}", nal.len());
 
                     if submitted {
                         let view_params_lock = &mut *ctx.global_view_params_queue.lock();
@@ -484,6 +492,7 @@ fn connection_pipeline(
 
                 match maybe_packet {
                     Ok(ServerControlPacket::DecoderConfig(config)) => {
+                        info!("[INTEL-XR-VIDEO] CONTROL_DECODER_CONFIG codec={:?} bytes={}", config.codec, config.config_buffer.len());
                         event_queue
                             .lock()
                             .push_back(ClientCoreEvent::DecoderConfig {
@@ -559,8 +568,10 @@ fn connection_pipeline(
         });
     }
     event_queue.lock().push_back(streaming_start_event);
+    info!("[INTEL-XR-VIDEO] STREAMING_EVENT_QUEUED");
 
     *connection_state_lock = ConnectionState::Streaming;
+    info!("[INTEL-XR-VIDEO] CONNECTION_STATE_STREAMING");
 
     dbg_connection!("connection_pipeline: Unlock streams");
 
