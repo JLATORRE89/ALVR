@@ -586,9 +586,18 @@ fn connection_pipeline(
 
     info!("[INTEL-XR-VIDEO] STREAM_RECEIVE_THREAD_SPAWNED");
     info!("[INTEL-XR-VIDEO] INSTALL_SENDERS_BEGIN");
+
+    info!("[INTEL-XR-VIDEO] INSTALL_CONTROL_SENDER_BEGIN");
     *ctx.control_sender.lock() = Some(control_sender);
+    info!("[INTEL-XR-VIDEO] INSTALL_CONTROL_SENDER_OK");
+
+    info!("[INTEL-XR-VIDEO] INSTALL_TRACKING_SENDER_BEGIN");
     *ctx.tracking_sender.lock() = Some(tracking_sender);
+    info!("[INTEL-XR-VIDEO] INSTALL_TRACKING_SENDER_OK");
+
+    info!("[INTEL-XR-VIDEO] INSTALL_STATISTICS_SENDER_BEGIN");
     *ctx.statistics_sender.lock() = Some(statistics_sender);
+    info!("[INTEL-XR-VIDEO] INSTALL_STATISTICS_SENDER_OK");
     if let Switch::Enabled(filter_level) = settings.extra.logging.client_log_report_level {
         *LOG_CHANNEL_SENDER.lock() = Some(LogMirrorData {
             sender: log_channel_sender,
