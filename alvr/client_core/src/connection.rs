@@ -598,13 +598,17 @@ fn connection_pipeline(
     info!("[INTEL-XR-VIDEO] INSTALL_STATISTICS_SENDER_BEGIN");
     *ctx.statistics_sender.lock() = Some(statistics_sender);
     info!("[INTEL-XR-VIDEO] INSTALL_STATISTICS_SENDER_OK");
+    info!("[INTEL-XR-VIDEO] LOG_MIRROR_INSTALL_BEGIN enabled={}", matches!(settings.extra.logging.client_log_report_level, Switch::Enabled(_)));
     if let Switch::Enabled(filter_level) = settings.extra.logging.client_log_report_level {
+        info!("[INTEL-XR-VIDEO] LOG_MIRROR_LOCK_BEGIN");
         *LOG_CHANNEL_SENDER.lock() = Some(LogMirrorData {
             sender: log_channel_sender,
             filter_level,
             debug_groups_config: settings.extra.logging.debug_groups,
         });
+        info!("[INTEL-XR-VIDEO] LOG_MIRROR_LOCK_OK");
     }
+    info!("[INTEL-XR-VIDEO] LOG_MIRROR_INSTALL_OK");
     info!("[INTEL-XR-VIDEO] INSTALL_SENDERS_OK");
     event_queue.lock().push_back(streaming_start_event);
     info!("[INTEL-XR-VIDEO] STREAMING_EVENT_QUEUED");
