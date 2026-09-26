@@ -99,6 +99,8 @@ pub struct StreamContext {
     renderer: StreamRenderer,
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     use_custom_reprojection: bool,
+    intel_xr_waiting_frame_logged: bool,
+    intel_xr_first_frame_logged: bool,
 }
 
 impl StreamContext {
@@ -243,6 +245,8 @@ impl StreamContext {
             target_view_resolution,
             renderer,
             decoder: None,
+            intel_xr_waiting_frame_logged: false,
+            intel_xr_first_frame_logged: false,
         };
 
         this.update_reference_space();
@@ -431,9 +435,13 @@ impl StreamContext {
         }
 
         if buffer_ptr.is_null() {
-            info!("[INTEL-XR-VIDEO] STREAM_RENDER no_decoded_frame");
-        } else {
-            info!("[INTEL-XR-VIDEO] STREAM_RENDER decoded_frame");
+            if !self.intel_xr_waiting_frame_logged {
+                info!("[INTEL-XR-VIDEO] STREAM_RENDER waiting_for_first_decoded_frame");
+                self.intel_xr_waiting_frame_logged = true;
+            }
+        } else if !self.intel_xr_first_frame_logged {
+            info!("[INTEL-XR-VIDEO] STREAM_RENDER first_decoded_frame");
+            self.intel_xr_first_frame_logged = true;
         }
         self.renderer.render(
             buffer_ptr,
