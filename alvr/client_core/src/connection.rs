@@ -598,15 +598,23 @@ fn connection_pipeline(
     info!("[INTEL-XR-VIDEO] INSTALL_STATISTICS_SENDER_BEGIN");
     *ctx.statistics_sender.lock() = Some(statistics_sender);
     info!("[INTEL-XR-VIDEO] INSTALL_STATISTICS_SENDER_OK");
-    info!("[INTEL-XR-VIDEO] LOG_MIRROR_INSTALL_BEGIN enabled={}", matches!(settings.extra.logging.client_log_report_level, Switch::Enabled(_)));
+    // IMPORTANT: do not emit a log record while holding LOG_CHANNEL_SENDER.
+    // The logger itself calls send_log(), which locks LOG_CHANNEL_SENDER. Logging from
+    // inside this critical section therefore self-deadlocks as soon as mirroring is enabled.
+    let log_mirror_enabled =
+        matches!(settings.extra.logging.client_log_report_level, Switch::Enabled(_));
+    info!("[INTEL-XR-VIDEO] LOG_MIRROR_INSTALL_BEGIN enabled={log_mirror_enabled}");
     if let Switch::Enabled(filter_level) = settings.extra.logging.client_log_report_level {
-        info!("[INTEL-XR-VIDEO] LOG_MIRROR_LOCK_BEGIN");
-        *LOG_CHANNEL_SENDER.lock() = Some(LogMirrorData {
-            sender: log_channel_sender,
-            filter_level,
-            debug_groups_config: settings.extra.logging.debug_groups,
-        });
-        info!("[INTEL-XR-VIDEO] LOG_MIRROR_LOCK_OK");
+        {
+            let mut log_channel_sender_lock = LOG_CHANNEL_SENDER.lock();
+            *log_channel_sender_lock = Some(LogMirrorData {
+                sender: log_channel_sender,
+                filter_level,
+                debug_groups_config: settings.extra.logging.debug_groups,
+            });
+        }
+        // This is intentionally after the guard has been dropped.
+        info!("[INTEL-XR-VIDEO] LOG_MIRROR_INSTALLED");
     }
     info!("[INTEL-XR-VIDEO] LOG_MIRROR_INSTALL_OK");
     info!("[INTEL-XR-VIDEO] INSTALL_SENDERS_OK");
