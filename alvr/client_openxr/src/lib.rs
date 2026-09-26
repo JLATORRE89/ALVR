@@ -532,8 +532,23 @@ pub fn entry_point() {
                 continue;
             }
 
+            // Diagnostic escape hatch: the PC test can create this marker over ADB when its
+            // unattended capture is complete. Render the lobby HUD so the wearer knows it is
+            // safe to remove the headset without contaminating the test with a DOFF event.
+            #[cfg(target_os = "android")]
+            let diagnostic_done = std::path::Path::new("/sdcard/intel-xr-diagnostic.done").exists();
+            #[cfg(not(target_os = "android"))]
+            let diagnostic_done = false;
+
+            if diagnostic_done {
+                last_lobby_message = String::from("INTEL XR DIAGNOSTIC\nTEST COMPLETE\nYOU MAY REMOVE HEADSET");
+                lobby.update_hud_message(&last_lobby_message);
+            }
+
             // todo: allow rendering lobby and stream layers at the same time and add cross fade
-            let (layer, display_time) = if let Some(stream) = &mut stream_context {
+            let (layer, display_time) = if diagnostic_done {
+                (lobby.render(vsync_time), vsync_time)
+            } else if let Some(stream) = &mut stream_context {
                 stream.render(frame_interval, vsync_time)
             } else {
                 (lobby.render(vsync_time), vsync_time)
