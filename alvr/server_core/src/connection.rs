@@ -550,13 +550,19 @@ fn connection_pipeline(
             );
 
             if info.client_protocol_id != alvr_common::protocol_id_u64() {
+                let legacy_test = std::env::var("ALVR_LEGACY_PROTOCOL_TEST")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
                 warn!(
-                    "Trusted client is incompatible! Expected protocol ID: {}, found: {}",
+                    "Trusted client protocol mismatch! Expected protocol ID: {}, found: {}. Legacy test mode: {}",
                     alvr_common::protocol_id_u64(),
                     info.client_protocol_id,
+                    legacy_test,
                 );
-
-                return Ok(());
+                if !legacy_test {
+                    return Ok(());
+                }
+                warn!("TEST ONLY: continuing handshake despite ALVR protocol mismatch");
             }
 
             info.streaming_capabilities

@@ -322,8 +322,8 @@ fn connection_pipeline(
                         .is_some_and(|callback| callback(header.timestamp, nal));
 
                     if submitted {
-                        let view_params_lock = &mut *ctx.view_params_queue.write();
-                        view_params_lock.push_back((header.timestamp, header.views_params));
+                        let view_params_lock = &mut *ctx.global_view_params_queue.lock();
+                        view_params_lock.push_back((header.timestamp, header.global_view_params));
 
                         if view_params_lock.len() > 1024 {
                             view_params_lock.pop_front();
