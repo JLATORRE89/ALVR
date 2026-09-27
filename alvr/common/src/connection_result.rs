@@ -65,9 +65,12 @@ pub trait HandleTryAgain<T> {
 impl<T> HandleTryAgain<T> for io::Result<T> {
     fn handle_try_again(self) -> ConResult<T> {
         self.map_err(|e| {
-            // Ignore ERROR_IO_PENDING on Windows (code 997)
+            // Ignore ERROR_IO_PENDING on Windows (code 997).
+            // EINTR (a signal interrupted a blocking socket call) is retryable, not a
+            // disconnect: signals are delivered to the host process (e.g. Monado).
             if e.kind() == io::ErrorKind::TimedOut
                 || e.kind() == io::ErrorKind::WouldBlock
+                || e.kind() == io::ErrorKind::Interrupted
                 || (cfg!(windows) && e.raw_os_error() == Some(997))
             {
                 ConnectionError::TryAgain(e.into())
