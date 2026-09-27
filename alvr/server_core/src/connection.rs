@@ -46,6 +46,7 @@ pub const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
+const CLIENT_IDR_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct VideoPacket {
     pub header: VideoPacketHeader,
@@ -1239,6 +1240,9 @@ fn connection_pipeline(
         let client_hostname = client_hostname.clone();
         move || {
             let mut disconnection_deadline = Instant::now() + KEEPALIVE_TIMEOUT;
+            // The client asks for an IDR on every lost/skipped packet while it waits;
+            // forward (and resend the decoder config) at most once per interval.
+            let mut last_client_idr_request: Option<Instant> = None;
             while is_streaming(&client_hostname) {
                 let packet = match control_receiver.recv(STREAMING_RECV_TIMEOUT) {
                     Ok(packet) => packet,
@@ -1281,7 +1285,12 @@ fn connection_pipeline(
                             }
                         }
                     }
+                    ClientControlPacket::RequestIdr
+                        if last_client_idr_request.is_some_and(|last| {
+                            Instant::now() < last + CLIENT_IDR_REQUEST_MIN_INTERVAL
+                        }) => {}
                     ClientControlPacket::RequestIdr => {
+                        last_client_idr_request = Some(Instant::now());
                         if let Some(config) = ctx.decoder_config.lock().clone() {
                             let codec = config.codec;
                             let config_bytes = config.config_buffer.len();

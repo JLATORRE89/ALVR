@@ -499,11 +499,15 @@ impl ServerCoreContext {
                     info!("[INTEL-XR-SERVER] VIDEO_CHANNEL_ENQUEUE");
                 }
                 if matches!(sender_result, Err(TrySendError::Full(_))) {
-                    STREAM_CORRUPTED.store(true, Ordering::SeqCst);
-                    self.connection_context
-                        .events_sender
-                        .send(ServerCoreEvent::RequestIDR)
-                        .ok();
+                    // Request one IDR when the stream becomes corrupted, or when the
+                    // dropped frame was itself the recovery IDR; not on every drop.
+                    let was_corrupted = STREAM_CORRUPTED.swap(true, Ordering::SeqCst);
+                    if !was_corrupted || is_idr {
+                        self.connection_context
+                            .events_sender
+                            .send(ServerCoreEvent::RequestIDR)
+                            .ok();
+                    }
                     self.connection_context
                         .bitrate_manager
                         .lock()
