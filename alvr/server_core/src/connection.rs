@@ -25,7 +25,7 @@ use alvr_packets::{
 };
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize, H264Profile,
-    OpenvrConfig, SessionConfig, SocketProtocol,
+    OpenvrConfig, SessionConfig, SocketBufferSize, SocketProtocol,
 };
 use alvr_sockets::{
     CONTROL_PORT, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, PeerType, ProtoControlSocket,
@@ -47,6 +47,8 @@ const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 const CLIENT_IDR_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(100);
+// Minimum video queue for wired (USB) connections.
+const WIRED_MIN_QUEUED_VIDEO_FRAMES: usize = 16;
 // Video send buffer sizing (UDP): frames of the current bitrate, clamped.
 const SEND_BUFFER_FRAMES: f32 = 3.0;
 // Video shard pacing rate relative to the current bitrate (UDP only).
@@ -859,7 +861,13 @@ fn connection_pipeline(
         initial_settings.connection.stream_port,
         stream_protocol,
         initial_settings.connection.dscp,
-        initial_settings.connection.server_send_buffer_bytes,
+        // Wired (TCP over ADB): latency-bounding small send buffers only cause false
+        // congestion on stalls; use the maximum. Wireless keeps the configured size.
+        if wired {
+            SocketBufferSize::Maximum
+        } else {
+            initial_settings.connection.server_send_buffer_bytes
+        },
         initial_settings.connection.server_recv_buffer_bytes,
         initial_settings.connection.packet_size as _,
     )?;
@@ -875,8 +883,14 @@ fn connection_pipeline(
     let mut statics_receiver =
         stream_socket.subscribe_to_stream::<ClientStatistics>(STATISTICS, MAX_UNREAD_PACKETS);
 
-    let (video_channel_sender, video_channel_receiver) =
-        std::sync::mpsc::sync_channel(initial_settings.connection.max_queued_server_video_frames);
+    // Wired links stall briefly (ADB scheduling) but have ample throughput: a deeper queue
+    // absorbs that instead of dropping frames and cutting the bitrate.
+    let video_queue_frames = if wired {
+        initial_settings.connection.max_queued_server_video_frames.max(WIRED_MIN_QUEUED_VIDEO_FRAMES)
+    } else {
+        initial_settings.connection.max_queued_server_video_frames
+    };
+    let (video_channel_sender, video_channel_receiver) = std::sync::mpsc::sync_channel(video_queue_frames);
     *ctx.video_channel_sender.lock() = Some(video_channel_sender);
     eprintln!(
         "[INTEL-XR-CONNECTION-RAW] VIDEO_CHANNEL_INSTALL ctx={:p}",
