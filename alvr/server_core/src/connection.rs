@@ -255,76 +255,77 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
         dbg_connection!("handshake_loop: Try connect to wired device");
 
         let mut wired_client_ips = HashMap::new();
-        if SESSION_MANAGER
-            .read()
-            .client_list()
-            .iter()
-            .any(|(hostname, info)| {
-                info.connection_state == ConnectionState::Disconnected
-                    && hostname.as_str() == WIRED_CLIENT_HOSTNAME
-            })
-        {
-            // Make sure the wired connection is created once and kept alive
-            let wired_connection = if let Some(connection) = &wired_connection {
-                connection
-            } else {
-                let connection = match WiredConnection::new(
-                    FILESYSTEM_LAYOUT.get().unwrap(),
-                    |downloaded, maybe_total| {
-                        if let Some(total) = maybe_total {
-                            alvr_events::send_event(EventType::Adb(AdbEvent {
-                                download_progress: downloaded as f32 / total as f32,
-                            }));
-                        };
-                    },
+        // Wired not ready (no cable, no client, ADB error): fall through to the
+        // wireless paths below instead of skipping them for this iteration.
+        'wired: {
+            if SESSION_MANAGER
+                .read()
+                .client_list()
+                .iter()
+                .any(|(hostname, info)| {
+                    info.connection_state == ConnectionState::Disconnected
+                        && hostname.as_str() == WIRED_CLIENT_HOSTNAME
+                })
+            {
+                // Make sure the wired connection is created once and kept alive
+                let wired_connection = if let Some(connection) = &wired_connection {
+                    connection
+                } else {
+                    let connection = match WiredConnection::new(
+                        FILESYSTEM_LAYOUT.get().unwrap(),
+                        |downloaded, maybe_total| {
+                            if let Some(total) = maybe_total {
+                                alvr_events::send_event(EventType::Adb(AdbEvent {
+                                    download_progress: downloaded as f32 / total as f32,
+                                }));
+                            };
+                        },
+                    ) {
+                        Ok(connection) => connection,
+                        Err(e) => {
+                            error!("{e:?}");
+                            break 'wired;
+                        }
+                    };
+
+                    wired_connection = Some(connection);
+
+                    wired_connection.as_ref().unwrap()
+                };
+
+                let stream_port;
+                let client_type;
+                let client_autolaunch;
+                {
+                    let session_manager_lock = SESSION_MANAGER.read();
+                    let connection = &session_manager_lock.settings().connection;
+                    stream_port = connection.stream_port;
+                    client_type = connection.wired_client_type.clone();
+                    client_autolaunch = connection.wired_client_autolaunch.as_option().cloned();
+                }
+
+                let status = match wired_connection.setup(
+                    CONTROL_PORT,
+                    stream_port,
+                    &client_type,
+                    client_autolaunch,
                 ) {
-                    Ok(connection) => connection,
+                    Ok(status) => status,
                     Err(e) => {
                         error!("{e:?}");
-                        thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
-                        continue;
+                        break 'wired;
                     }
                 };
 
-                wired_connection = Some(connection);
-
-                wired_connection.as_ref().unwrap()
-            };
-
-            let stream_port;
-            let client_type;
-            let client_autolaunch;
-            {
-                let session_manager_lock = SESSION_MANAGER.read();
-                let connection = &session_manager_lock.settings().connection;
-                stream_port = connection.stream_port;
-                client_type = connection.wired_client_type.clone();
-                client_autolaunch = connection.wired_client_autolaunch.as_option().cloned();
-            }
-
-            let status = match wired_connection.setup(
-                CONTROL_PORT,
-                stream_port,
-                &client_type,
-                client_autolaunch,
-            ) {
-                Ok(status) => status,
-                Err(e) => {
-                    error!("{e:?}");
-                    thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
-                    continue;
+                #[cfg_attr(not(debug_assertions), expect(unused_variables))]
+                if let WiredConnectionStatus::NotReady(s) = status {
+                    dbg_connection!("handshake_loop: Wired connection not ready: {s}");
+                    break 'wired;
                 }
-            };
 
-            #[cfg_attr(not(debug_assertions), expect(unused_variables))]
-            if let WiredConnectionStatus::NotReady(s) = status {
-                dbg_connection!("handshake_loop: Wired connection not ready: {s}");
-                thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
-                continue;
+                let client_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+                wired_client_ips.insert(client_ip, WIRED_CLIENT_HOSTNAME.to_owned());
             }
-
-            let client_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-            wired_client_ips.insert(client_ip, WIRED_CLIENT_HOSTNAME.to_owned());
         }
 
         if !wired_client_ips.is_empty()
