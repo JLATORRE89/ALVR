@@ -451,15 +451,30 @@ pub unsafe extern "C" fn alvr_send_video_nal(
     len: i32,
 ) {
     static INTEL_XR_CAPI_VIDEO_ENTER_LOGGED: AtomicBool = AtomicBool::new(false);
-    if !INTEL_XR_CAPI_VIDEO_ENTER_LOGGED.swap(true, Ordering::SeqCst) {
+    let first_probe = !INTEL_XR_CAPI_VIDEO_ENTER_LOGGED.swap(true, Ordering::SeqCst);
+    if first_probe {
+        eprintln!("[INTEL-XR-CAPI-RAW] ENTER len={} idr={}", len, is_idr);
+    }
+
+    let context_lock = SERVER_CORE_CONTEXT.read();
+    let context_present = context_lock.is_some();
+    if first_probe {
+        eprintln!(
+            "[INTEL-XR-CAPI-RAW] CONTEXT_PRESENT={}",
+            context_present
+        );
         alvr_common::info!(
             "[INTEL-XR-SERVER] CAPI_VIDEO_NAL_ENTER len={} idr={} context_present={}",
             len,
             is_idr,
-            SERVER_CORE_CONTEXT.read().is_some()
+            context_present
         );
     }
-    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+
+    if let Some(context) = &*context_lock {
+        if first_probe {
+            eprintln!("[INTEL-XR-CAPI-RAW] DISPATCH_SERVER_CORE");
+        }
         let buffer = unsafe { std::slice::from_raw_parts(buffer_ptr, len as usize) };
 
         let global_view_params = unsafe {
@@ -475,6 +490,11 @@ pub unsafe extern "C" fn alvr_send_video_nal(
             is_idr,
             buffer.to_vec(),
         );
+        if first_probe {
+            eprintln!("[INTEL-XR-CAPI-RAW] RETURN_SERVER_CORE");
+        }
+    } else if first_probe {
+        eprintln!("[INTEL-XR-CAPI-RAW] DROP_NO_SERVER_CORE_CONTEXT");
     }
 }
 
