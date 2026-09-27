@@ -47,6 +47,12 @@ const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 const CLIENT_IDR_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(100);
+// Video send buffer sizing (UDP): frames of the current bitrate, clamped.
+const SEND_BUFFER_FRAMES: f32 = 3.0;
+// Video shard pacing rate relative to the current bitrate (UDP only).
+const PACING_BITRATE_MULTIPLIER: f32 = 1.5;
+const SEND_BUFFER_MIN_BYTES: f32 = 32.0 * 1024.0;
+const SEND_BUFFER_MAX_BYTES: f32 = 2.0 * 1024.0 * 1024.0;
 
 pub struct VideoPacket {
     pub header: VideoPacketHeader,
@@ -842,6 +848,8 @@ fn connection_pipeline(
     } else {
         initial_settings.connection.stream_protocol
     };
+    // Pace video shards on UDP (Wi-Fi); TCP (wired) has its own flow control.
+    let pace_video = matches!(stream_protocol, SocketProtocol::Udp);
 
     dbg_connection!("connection_pipeline: StreamSocket connect_to_client");
     eprintln!("[INTEL-XR-CONNECTION-RAW] STREAM_SOCKET_CONNECT_BEGIN ctx={:p}", Arc::as_ptr(&ctx));
@@ -891,7 +899,40 @@ fn connection_pipeline(
             let mut intel_xr_video_packet_sent_logged = false;
             let mut intel_xr_video_sent_count: u64 = 0;
             let mut intel_xr_video_send_errors: u64 = 0;
+            // Keep the kernel send buffer at a few frames of the current bitrate so a
+            // congested link queues ~SEND_BUFFER_FRAMES frame-times, not seconds (UDP only).
+            let mut last_send_buffer_check = Instant::now();
+            let mut applied_send_buffer_bytes = 0_usize;
             while is_streaming(&client_hostname) {
+                if last_send_buffer_check.elapsed() >= Duration::from_secs(1) {
+                    last_send_buffer_check = Instant::now();
+                    let (bitrate_bps, framerate) = {
+                        let manager = ctx.bitrate_manager.lock();
+                        (manager.last_requested_bitrate_bps(), manager.nominal_framerate())
+                    };
+                    if bitrate_bps > 0.0 && framerate > 0.0 {
+                        let target = (bitrate_bps / 8.0 / framerate * SEND_BUFFER_FRAMES)
+                            .clamp(SEND_BUFFER_MIN_BYTES, SEND_BUFFER_MAX_BYTES)
+                            as usize;
+                        let differs = applied_send_buffer_bytes == 0
+                            || target.abs_diff(applied_send_buffer_bytes) * 5
+                                > applied_send_buffer_bytes;
+                        if pace_video {
+                            video_sender.set_pacing(Some(bitrate_bps * PACING_BITRATE_MULTIPLIER));
+                        }
+                        if differs {
+                            applied_send_buffer_bytes = target;
+                            match video_sender.set_send_buffer_size(target) {
+                                Ok(0) => (),
+                                Ok(actual) => info!(
+                                    "[INTEL-XR-SERVER] SEND_BUFFER_RESIZE target={target} kernel={actual} bitrate_bps={bitrate_bps}"
+                                ),
+                                Err(e) => warn!("Failed to resize video send buffer: {e}"),
+                            }
+                        }
+                    }
+                }
+
                 let VideoPacket {
                     mut header,
                     payload,

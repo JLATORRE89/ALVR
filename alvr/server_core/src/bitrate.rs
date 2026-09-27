@@ -74,6 +74,14 @@ impl BitrateManager {
         }
     }
 
+    pub fn last_requested_bitrate_bps(&self) -> f32 {
+        self.last_requested_bitrate_bps
+    }
+
+    pub fn nominal_framerate(&self) -> f32 {
+        1.0 / self.nominal_frame_interval.as_secs_f32()
+    }
+
     // Called when an encoded frame cannot be queued for the network (video channel full).
     // Clients only report statistics for frames they receive, so without this a saturated
     // link produces no feedback and the bitrate never comes down.

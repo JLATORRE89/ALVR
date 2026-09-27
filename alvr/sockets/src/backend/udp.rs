@@ -47,6 +47,13 @@ impl SocketWriter for UdpSocket {
 
         Ok(())
     }
+
+    fn set_send_buffer_size(&mut self, bytes: usize) -> Result<usize> {
+        let socket = socket2::SockRef::from(&*self);
+        socket.set_send_buffer_size(bytes)?;
+
+        Ok(socket.send_buffer_size()?)
+    }
 }
 
 impl SocketReader for Socket {

@@ -5,6 +5,12 @@ use alvr_common::{ConResult, anyhow::Result};
 
 pub trait SocketWriter: Send {
     fn send(&mut self, buffer: &[u8]) -> Result<()>;
+
+    // Resize the kernel send buffer at runtime. Returns the size the kernel reports (0 if
+    // the backend does not support resizing).
+    fn set_send_buffer_size(&mut self, _bytes: usize) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 // Trait used to abstract different socket (or other input/output) implementations. The funtionality

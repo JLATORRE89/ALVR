@@ -17,6 +17,9 @@
 // cannot be removed. This is because we need to make sure at least shards are written whole.
 
 use crate::backend::{SocketReader, SocketWriter, tcp, udp};
+
+// Burst allowance for shard pacing: up to this much sending "credit" can accumulate.
+const PACING_BURST: std::time::Duration = std::time::Duration::from_millis(2);
 use alvr_common::{
     AnyhowToCon, ConResult, HandleTryAgain, ToCon, anyhow::Result, debug, parking_lot::Mutex,
 };
@@ -89,6 +92,9 @@ pub struct StreamSender<H> {
     // if the packet index overflows the worst that happens is a false positive packet loss
     next_packet_index: u32,
     used_buffers: Vec<Vec<u8>>,
+    // Optional shard pacing (token bucket) to avoid bursting whole frames onto slow links.
+    pacing_bits_per_sec: Option<f32>,
+    next_shard_instant: std::time::Instant,
     _phantom: PhantomData<H>,
 }
 
@@ -119,6 +125,21 @@ impl<H> StreamSender<H> {
             sub_buffer[10..14].copy_from_slice(&(shards_count as u32).to_le_bytes());
             sub_buffer[14..18].copy_from_slice(&(idx as u32).to_le_bytes());
 
+            if let Some(rate) = self.pacing_bits_per_sec {
+                let now = std::time::Instant::now();
+                // Allow a small burst, then space shards at the configured rate. Sleep outside
+                // the socket lock so other streams can interleave.
+                let burst_floor = now.checked_sub(PACING_BURST).unwrap_or(now);
+                if self.next_shard_instant < burst_floor {
+                    self.next_shard_instant = burst_floor;
+                }
+                if self.next_shard_instant > now {
+                    std::thread::sleep(self.next_shard_instant - now);
+                }
+                self.next_shard_instant +=
+                    std::time::Duration::from_secs_f32(packet_length as f32 * 8.0 / rate);
+            }
+
             self.inner.lock().send(&sub_buffer[..packet_length])?;
         }
 
@@ -144,6 +165,17 @@ impl<H: Serialize> StreamSender<H> {
             hidden_offset: SHARD_PREFIX_SIZE + encoded_size,
             _phantom: PhantomData,
         })
+    }
+
+    // Pace shards at `bits_per_sec` (None: send back-to-back).
+    pub fn set_pacing(&mut self, bits_per_sec: Option<f32>) {
+        self.pacing_bits_per_sec = bits_per_sec.filter(|rate| *rate > 0.0);
+    }
+
+    // Resize the kernel send buffer (UDP). Returns the size reported by the kernel, or 0 if
+    // unsupported by the backend.
+    pub fn set_send_buffer_size(&self, bytes: usize) -> Result<usize> {
+        self.inner.lock().set_send_buffer_size(bytes)
     }
 
     pub fn send_header(&mut self, header: &H) -> Result<()> {
@@ -396,6 +428,8 @@ impl StreamSocket {
             max_packet_size: self.max_packet_size,
             next_packet_index: 0,
             used_buffers: vec![],
+            pacing_bits_per_sec: None,
+            next_shard_instant: std::time::Instant::now(),
             _phantom: PhantomData,
         }
     }
