@@ -146,6 +146,9 @@ fn create_session(
 }
 
 pub fn entry_point() {
+    // Android may keep the process (and this static) alive after Activity.finish();
+    // a relaunch must start with a clear exit request.
+    APP_EXIT_REQUESTED.store(false, Ordering::Relaxed);
     alvr_client_core::init_logging();
 
     // Using a provisional platform, before we can get the runtime info
@@ -674,4 +677,11 @@ fn android_main(app: android_activity::AndroidApp) {
 
     // Note: the quit event is sent from OpenXR too, this will return rather quicly.
     rendering_thread.join().unwrap();
+
+    // After an in-app exit Android may keep this process cached and reuse it on the next
+    // launch, where the client would not start again. End the process so relaunch is fresh.
+    if finish_requested {
+        info!("[INTEL-XR-EXIT] PROCESS_EXIT");
+        std::process::exit(0);
+    }
 }
