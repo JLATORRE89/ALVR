@@ -504,6 +504,10 @@ impl ServerCoreContext {
                         .events_sender
                         .send(ServerCoreEvent::RequestIDR)
                         .ok();
+                    self.connection_context
+                        .bitrate_manager
+                        .lock()
+                        .report_send_congestion();
                     warn!("Dropping video packet. Reason: Can't push to network");
                 }
             } else {
