@@ -8,14 +8,14 @@ use alvr_client_core::{
 };
 use alvr_common::{
     DETACHED_CONTROLLER_LEFT_ID, DETACHED_CONTROLLER_RIGHT_ID, HAND_LEFT_ID, HAND_RIGHT_ID,
-    HEAD_ID, Pose, RelaxedAtomic, ViewParams,
+    HEAD_ID, LEFT_MENU_CLICK_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::Result,
     error, info,
     glam::{UVec2, Vec2},
     parking_lot::RwLock,
 };
 use alvr_graphics::{GraphicsContext, StreamRenderer, StreamViewParams};
-use alvr_packets::{RealTimeConfig, StreamConfig, TrackingData};
+use alvr_packets::{ButtonValue, RealTimeConfig, StreamConfig, TrackingData};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
     FoveatedEncodingConfig, MediacodecProperty, PassthroughMode, UpscalingConfig,
@@ -536,6 +536,8 @@ impl Drop for StreamContext {
     }
 }
 
+const EXIT_MENU_HOLD: Duration = Duration::from_secs(2);
+
 fn stream_input_loop(
     core_ctx: &ClientCoreContext,
     xr_session: xr::Session<xr::OpenGlEs>,
@@ -550,6 +552,7 @@ fn stream_input_loop(
     let mut last_view_params = [ViewParams::DUMMY; 2];
 
     let mut deadline = Instant::now();
+    let mut menu_hold_start: Option<Instant> = None;
     let frame_interval = Duration::from_secs_f32(1.0 / refresh_rate);
     while running.value() {
         let int_ctx = &*interaction_ctx.read();
@@ -667,6 +670,19 @@ fn stream_input_loop(
         });
 
         let button_entries = interaction::update_buttons(&xr_session, &int_ctx.button_actions);
+        // Hold the left menu button to quit the app from inside the headset.
+        for entry in &button_entries {
+            if entry.path_id == *LEFT_MENU_CLICK_ID
+                && let ButtonValue::Binary(pressed) = entry.value
+            {
+                menu_hold_start = pressed.then(Instant::now);
+            }
+        }
+        if menu_hold_start.is_some_and(|start| start.elapsed() >= EXIT_MENU_HOLD)
+            && !crate::APP_EXIT_REQUESTED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            info!("[INTEL-XR-EXIT] MENU_HOLD_EXIT");
+        }
         if !button_entries.is_empty() {
             core_ctx.send_buttons(button_entries);
         }

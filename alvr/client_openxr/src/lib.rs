@@ -27,7 +27,20 @@ use interaction::{InteractionContext, InteractionSourcesConfig};
 use lobby::Lobby;
 use openxr as xr;
 use passthrough::PassthroughLayer;
-use std::{path::Path, rc::Rc, sync::Arc, thread, time::Duration};
+use std::{
+    path::Path,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
+
+// Set by the stream input thread when the user holds the left menu button to quit.
+// Once set, the session is exited and the app finishes instead of re-creating a session.
+pub static APP_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 use stream::StreamContext;
 
 fn from_xr_vec3(v: xr::Vector3f) -> Vec3 {
@@ -338,7 +351,17 @@ pub fn entry_point() {
 
         let mut event_storage = xr::EventDataBuffer::new();
         let mut headset_is_worn = true;
+        let mut exit_session_requested = false;
         'render_loop: loop {
+            if session_running
+                && !exit_session_requested
+                && APP_EXIT_REQUESTED.load(Ordering::Relaxed)
+            {
+                info!("[INTEL-XR-EXIT] REQUEST_EXIT_SESSION");
+                xr_session.request_exit().ok();
+                exit_session_requested = true;
+            }
+
             while let Some(event) = xr_instance.poll_event(&mut event_storage).unwrap() {
                 match event {
                     xr::Event::EventsLost(event) => {
@@ -376,6 +399,10 @@ pub fn entry_point() {
                             xr_session.end().unwrap();
                         }
                         xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
+                            if APP_EXIT_REQUESTED.load(Ordering::Relaxed) {
+                                info!("[INTEL-XR-EXIT] SESSION_EXITED_QUIT_APP");
+                                break 'session_loop;
+                            }
                             break 'render_loop;
                         }
                         _ => (),
@@ -597,6 +624,20 @@ fn xr_runtime_now(xr_instance: &xr::Instance) -> Option<xr::Time> {
 }
 
 #[cfg(target_os = "android")]
+fn finish_activity() {
+    let context = ndk_context::android_context();
+    let vm = unsafe { jni::JavaVM::from_raw(context.vm().cast()) }.unwrap();
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return;
+    };
+    // The NativeActivity global reference is owned by the runtime; do not delete it.
+    let activity = unsafe { jni::objects::JObject::from_raw(context.context().cast()) };
+    if env.call_method(&activity, "finish", "()V", &[]).is_err() {
+        error!("[INTEL-XR-EXIT] Activity.finish() failed");
+    }
+}
+
+#[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(app: android_activity::AndroidApp) {
     use android_activity::{InputStatus, MainEvent, PollEvent};
@@ -611,7 +652,13 @@ fn android_main(app: android_activity::AndroidApp) {
     });
 
     let mut should_quit = false;
+    let mut finish_requested = false;
     while !should_quit {
+        // The render thread returns when the user quit from inside the app: close the activity.
+        if !finish_requested && rendering_thread.is_finished() {
+            finish_requested = true;
+            finish_activity();
+        }
         app.poll_events(Some(Duration::from_millis(100)), |event| match event {
             PollEvent::Main(MainEvent::Destroy) => {
                 should_quit = true;
