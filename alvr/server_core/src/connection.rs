@@ -887,6 +887,8 @@ fn connection_pipeline(
         let client_hostname = client_hostname.clone();
         move || {
             let mut intel_xr_video_packet_sent_logged = false;
+            let mut intel_xr_video_sent_count: u64 = 0;
+            let mut intel_xr_video_send_errors: u64 = 0;
             while is_streaming(&client_hostname) {
                 let VideoPacket {
                     mut header,
@@ -917,7 +919,28 @@ fn connection_pipeline(
                     .copy_from_slice(&payload);
                 let payload_len = payload.len();
                 let is_idr = header.is_idr;
-                if video_sender.send(buffer).is_ok() && !intel_xr_video_packet_sent_logged {
+                // A failed shard aborts the rest of the packet, so surface send
+                // errors (rate-limited) instead of discarding them.
+                let send_result = video_sender.send(buffer);
+                match &send_result {
+                    Ok(()) => intel_xr_video_sent_count += 1,
+                    Err(e) => {
+                        intel_xr_video_send_errors += 1;
+                        if intel_xr_video_send_errors <= 20 || intel_xr_video_send_errors % 500 == 0 {
+                            warn!(
+                                "[INTEL-XR-SERVER] VIDEO_PACKET_SEND_ERROR count={} bytes={} idr={} err={e}",
+                                intel_xr_video_send_errors, payload_len, is_idr
+                            );
+                        }
+                    }
+                }
+                if (intel_xr_video_sent_count + intel_xr_video_send_errors) % 500 == 0 {
+                    info!(
+                        "[INTEL-XR-SERVER] VIDEO_SEND_STATS sent={} errors={}",
+                        intel_xr_video_sent_count, intel_xr_video_send_errors
+                    );
+                }
+                if send_result.is_ok() && !intel_xr_video_packet_sent_logged {
                     info!(
                         "[INTEL-XR-SERVER] VIDEO_PACKET_SENT bytes={} idr={}",
                         payload_len, is_idr
