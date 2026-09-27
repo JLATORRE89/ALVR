@@ -394,7 +394,15 @@ impl ServerCoreContext {
     ) {
         dbg_server_core!("send_video_nal");
         static INTEL_XR_VIDEO_NAL_ENTER_LOGGED: AtomicBool = AtomicBool::new(false);
-        if !INTEL_XR_VIDEO_NAL_ENTER_LOGGED.swap(true, Ordering::SeqCst) {
+        let intel_xr_first_video_nal =
+            !INTEL_XR_VIDEO_NAL_ENTER_LOGGED.swap(true, Ordering::SeqCst);
+        if intel_xr_first_video_nal {
+            eprintln!(
+                "[INTEL-XR-SERVER-RAW] VIDEO_NAL_ENTER bytes={} idr={} ts_ns={}",
+                nal_buffer.len(),
+                is_idr,
+                timestamp.as_nanos()
+            );
             info!(
                 "[INTEL-XR-SERVER] VIDEO_NAL_ENTER bytes={} idr={} ts_ns={}",
                 nal_buffer.len(),
@@ -408,7 +416,17 @@ impl ServerCoreContext {
         static LAST_IDR_INSTANT: LazyLock<Mutex<Instant>> =
             LazyLock::new(|| Mutex::new(Instant::now()));
 
-        if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
+        if intel_xr_first_video_nal {
+            eprintln!("[INTEL-XR-SERVER-RAW] VIDEO_CHANNEL_LOCK_BEGIN");
+        }
+        let video_channel_lock = self.connection_context.video_channel_sender.lock();
+        if intel_xr_first_video_nal {
+            eprintln!(
+                "[INTEL-XR-SERVER-RAW] VIDEO_CHANNEL_LOCK_OK present={}",
+                video_channel_lock.is_some()
+            );
+        }
+        if let Some(sender) = &*video_channel_lock {
             static INTEL_XR_VIDEO_CHANNEL_READY_LOGGED: AtomicBool = AtomicBool::new(false);
             if !INTEL_XR_VIDEO_CHANNEL_READY_LOGGED.swap(true, Ordering::SeqCst) {
                 info!("[INTEL-XR-SERVER] VIDEO_CHANNEL_READY");
@@ -457,6 +475,9 @@ impl ServerCoreContext {
                     file.write_all(&nal_buffer).ok();
                 }
 
+                if intel_xr_first_video_nal {
+                    eprintln!("[INTEL-XR-SERVER-RAW] VIDEO_CHANNEL_TRY_SEND_BEGIN");
+                }
                 let sender_result = sender.try_send(VideoPacket {
                     header: VideoPacketHeader {
                         timestamp,
@@ -465,6 +486,12 @@ impl ServerCoreContext {
                     },
                     payload: nal_buffer,
                 });
+                if intel_xr_first_video_nal {
+                    eprintln!(
+                        "[INTEL-XR-SERVER-RAW] VIDEO_CHANNEL_TRY_SEND_RESULT ok={}",
+                        sender_result.is_ok()
+                    );
+                }
                 static INTEL_XR_VIDEO_ENQUEUE_LOGGED: AtomicBool = AtomicBool::new(false);
                 if sender_result.is_ok()
                     && !INTEL_XR_VIDEO_ENQUEUE_LOGGED.swap(true, Ordering::SeqCst)
