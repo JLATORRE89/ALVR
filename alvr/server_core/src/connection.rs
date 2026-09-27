@@ -872,6 +872,14 @@ fn connection_pipeline(
         "[INTEL-XR-CONNECTION-RAW] VIDEO_CHANNEL_INSTALL ctx={:p}",
         Arc::as_ptr(&ctx)
     );
+    // The encoder may have produced its startup IDR before the stream socket
+    // existed. Once the video transport is installed, explicitly request a
+    // fresh keyframe so the client can bootstrap from a valid IDR.
+    let idr_request_ok = ctx.events_sender.send(ServerCoreEvent::RequestIDR).is_ok();
+    eprintln!(
+        "[INTEL-XR-CONNECTION-RAW] REQUEST_IDR_AFTER_VIDEO_READY ok={}",
+        idr_request_ok
+    );
     *ctx.haptics_sender.lock() = Some(haptics_sender);
 
     let video_send_thread = thread::spawn({
