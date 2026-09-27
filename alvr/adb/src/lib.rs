@@ -36,13 +36,24 @@ impl WiredConnection {
         client_type: &ClientFlavor,
         client_autolaunch: Option<WiredClientAutoLaunchConfig>,
     ) -> Result<WiredConnectionStatus> {
-        let Some(device_serial) = commands::list_devices(&self.adb_path)?
+        let device_serials: Vec<String> = commands::list_devices(&self.adb_path)?
             .into_iter()
             .filter_map(|d| d.serial)
-            .find(|s| !s.starts_with("127.0.0.1"))
-        else {
+            .filter(|s| !s.starts_with("127.0.0.1"))
+            .collect();
+        if device_serials.is_empty() {
             return Ok(WiredConnectionStatus::NotReady(
                 "No wired devices found".to_owned(),
+            ));
+        }
+
+        // Several devices may be attached (e.g. a phone next to the headset): use the
+        // first one that has a suitable ALVR client installed.
+        let Some((device_serial, process_name)) = device_serials.into_iter().find_map(|serial| {
+            get_process_name(&self.adb_path, &serial, client_type).map(|name| (serial, name))
+        }) else {
+            return Ok(WiredConnectionStatus::NotReady(
+                "No suitable ALVR client is installed".to_owned(),
             ));
         };
 
@@ -59,13 +70,6 @@ impl WiredConnection {
                 "setup_wired_connection: Forwarded port {port} of device {device_serial}"
             );
         }
-
-        let Some(process_name) = get_process_name(&self.adb_path, &device_serial, client_type)
-        else {
-            return Ok(WiredConnectionStatus::NotReady(
-                "No suitable ALVR client is installed".to_owned(),
-            ));
-        };
 
         if commands::get_process_id(&self.adb_path, &device_serial, &process_name)?.is_none() {
             if let Some(client_autolaunch) = client_autolaunch {
