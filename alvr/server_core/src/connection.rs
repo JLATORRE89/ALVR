@@ -1399,14 +1399,14 @@ fn connection_pipeline(
                     .client_list()
                     .get(&client_hostname)
                     .is_some_and(|c| c.connection_state == ConnectionState::Streaming);
-                let lifecycle = *lifecycle_state.read();
-                let lifecycle_resumed = lifecycle == LifecycleState::Resumed;
+                let lifecycle = lifecycle_state.read();
+                let lifecycle_resumed = *lifecycle == LifecycleState::Resumed;
 
                 if !(client_streaming && lifecycle_resumed) {
                     eprintln!(
                         "[INTEL-XR-CONNECTION-RAW] SHUTDOWN_TRIGGER client_streaming={} lifecycle={:?} lifecycle_resumed={}",
                         client_streaming,
-                        lifecycle,
+                        &*lifecycle,
                         lifecycle_resumed
                     );
                     break;
