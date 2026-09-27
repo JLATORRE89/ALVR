@@ -864,6 +864,10 @@ fn connection_pipeline(
     let (video_channel_sender, video_channel_receiver) =
         std::sync::mpsc::sync_channel(initial_settings.connection.max_queued_server_video_frames);
     *ctx.video_channel_sender.lock() = Some(video_channel_sender);
+    eprintln!(
+        "[INTEL-XR-CONNECTION-RAW] VIDEO_CHANNEL_INSTALL ctx={:p}",
+        Arc::as_ptr(&ctx)
+    );
     *ctx.haptics_sender.lock() = Some(haptics_sender);
 
     let video_send_thread = thread::spawn({
@@ -1412,6 +1416,10 @@ fn connection_pipeline(
         crate::create_recording_file(&ctx, session_manager_lock.settings());
     }
 
+    eprintln!(
+        "[INTEL-XR-CONNECTION-RAW] MARK_STREAMING ctx={:p}",
+        Arc::as_ptr(&ctx)
+    );
     session_manager_lock.update_client_connections(
         client_hostname.clone(),
         ClientConnectionsAction::SetConnectionState(ConnectionState::Streaming),
@@ -1426,6 +1434,10 @@ fn connection_pipeline(
     dbg_connection!("connection_pipeline: Begin connection shutdown");
 
     // This requests shutdown from threads
+    eprintln!(
+        "[INTEL-XR-CONNECTION-RAW] VIDEO_CHANNEL_REMOVE ctx={:p}",
+        Arc::as_ptr(&ctx)
+    );
     *ctx.video_channel_sender.lock() = None;
     *ctx.haptics_sender.lock() = None;
 
