@@ -810,6 +810,7 @@ fn connection_pipeline(
     }
 
     dbg_connection!("connection_pipeline: Send StartStream packet");
+    eprintln!("[INTEL-XR-CONNECTION-RAW] SEND_START_STREAM ctx={:p}", Arc::as_ptr(&ctx));
     control_sender
         .send(&ServerControlPacket::StartStream)
         .to_con()?;
@@ -819,6 +820,7 @@ fn connection_pipeline(
         con_bail!("Got unexpected packet waiting for stream ack");
     }
     dbg_connection!("connection_pipeline: Got StreamReady packet");
+    eprintln!("[INTEL-XR-CONNECTION-RAW] GOT_STREAM_READY ctx={:p}", Arc::as_ptr(&ctx));
 
     *ctx.statistics_manager.write() = Some(StatisticsManager::new(
         initial_settings.connection.statistics_history_size,
@@ -840,6 +842,7 @@ fn connection_pipeline(
     };
 
     dbg_connection!("connection_pipeline: StreamSocket connect_to_client");
+    eprintln!("[INTEL-XR-CONNECTION-RAW] STREAM_SOCKET_CONNECT_BEGIN ctx={:p}", Arc::as_ptr(&ctx));
     let mut stream_socket = StreamSocketBuilder::connect_to_client(
         HANDSHAKE_ACTION_TIMEOUT,
         client_ip,
@@ -850,6 +853,7 @@ fn connection_pipeline(
         initial_settings.connection.server_recv_buffer_bytes,
         initial_settings.connection.packet_size as _,
     )?;
+    eprintln!("[INTEL-XR-CONNECTION-RAW] STREAM_SOCKET_CONNECT_OK ctx={:p}", Arc::as_ptr(&ctx));
 
     let mut video_sender = stream_socket.request_stream(VIDEO);
     let game_audio_sender: alvr_sockets::StreamSender<()> = stream_socket.request_stream(AUDIO);
