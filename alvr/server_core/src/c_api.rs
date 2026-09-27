@@ -17,7 +17,8 @@ use std::{
     path::PathBuf,
     ptr,
     str::FromStr,
-    sync::{LazyLock, mpsc},
+    sync::{
+        atomic::{AtomicBool, Ordering},LazyLock, mpsc},
     time::{Duration, Instant},
 };
 
@@ -449,6 +450,15 @@ pub unsafe extern "C" fn alvr_send_video_nal(
     buffer_ptr: *mut u8,
     len: i32,
 ) {
+    static INTEL_XR_CAPI_VIDEO_ENTER_LOGGED: AtomicBool = AtomicBool::new(false);
+    if !INTEL_XR_CAPI_VIDEO_ENTER_LOGGED.swap(true, Ordering::SeqCst) {
+        alvr_common::info!(
+            "[INTEL-XR-SERVER] CAPI_VIDEO_NAL_ENTER len={} idr={} context_present={}",
+            len,
+            is_idr,
+            SERVER_CORE_CONTEXT.read().is_some()
+        );
+    }
     if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
         let buffer = unsafe { std::slice::from_raw_parts(buffer_ptr, len as usize) };
 
