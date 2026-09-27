@@ -876,7 +876,16 @@ fn connection_pipeline(
                     mut header,
                     payload,
                 } = match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
-                    Ok(packet) => packet,
+                    Ok(packet) => {
+                        if !intel_xr_video_packet_sent_logged {
+                            info!(
+                                "[INTEL-XR-SERVER] VIDEO_CHANNEL_DEQUEUE bytes={} idr={}",
+                                packet.payload.len(),
+                                packet.header.is_idr
+                            );
+                        }
+                        packet
+                    },
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => return,
                 };
