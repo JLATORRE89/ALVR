@@ -570,15 +570,27 @@ fn connection_pipeline(
         let event_queue = Arc::clone(&event_queue);
         let disconnect_notif = Arc::clone(&disconnect_notif);
         move || {
+            // Heartbeat: shards processed vs TryAgain. ~2 TryAgain/s with no shards means
+            // nothing arrives; a hot TryAgain spin with no shards means a peeked datagram
+            // is never consumed; shards without VIDEO_PACKET_RECEIVED means reassembly fails.
+            let mut intel_xr_shards: u64 = 0;
+            let mut intel_xr_try_again: u64 = 0;
+            let mut intel_xr_last_report = Instant::now();
             while is_streaming(&ctx) {
                 match stream_socket.recv() {
-                    Ok(()) => (),
-                    Err(ConnectionError::TryAgain(_)) => continue,
+                    Ok(()) => intel_xr_shards += 1,
+                    Err(ConnectionError::TryAgain(_)) => intel_xr_try_again += 1,
                     Err(e) => {
                         info!("Client disconnected. Cause: {e}");
                         set_hud_message(&event_queue, SERVER_DISCONNECTED_MESSAGE);
                         disconnect_notif.notify_one();
                     }
+                }
+                if intel_xr_last_report.elapsed() >= Duration::from_secs(2) {
+                    info!(
+                        "[INTEL-XR-VIDEO] STREAM_RECV_STATS shards={intel_xr_shards} try_again={intel_xr_try_again}"
+                    );
+                    intel_xr_last_report = Instant::now();
                 }
             }
         }
