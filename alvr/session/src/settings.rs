@@ -2172,7 +2172,7 @@ pub fn session_settings_default() -> SettingsDefault {
             client_discovery: SwitchDefault {
                 enabled: true,
                 content: DiscoveryConfigDefault {
-                    auto_trust_clients: cfg!(debug_assertions),
+                    auto_trust_clients: true,
                 },
             },
             wired_client_type: ClientFlavorDefault {

@@ -27,7 +27,8 @@ use alvr_packets::{
 };
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize, GazeInputSource,
-    H264Profile, Settings, SocketProtocol, SteamvrHmdInitConfig,
+    H264Profile, Settings, SocketBufferConfig, SocketBufferSize,
+    SocketProtocol, SteamvrHmdInitConfig,
 };
 use alvr_sockets::{
     CONTROL_PORT, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, ProtoControlSocket, SocketConnection,
@@ -49,6 +50,15 @@ pub const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
+const CLIENT_IDR_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(100);
+// Minimum video queue for wired (USB) connections.
+const WIRED_MIN_QUEUED_VIDEO_FRAMES: usize = 16;
+// Video send buffer sizing (UDP): frames of the current bitrate, clamped.
+const SEND_BUFFER_FRAMES: f32 = 3.0;
+// Video shard pacing rate relative to the current bitrate (UDP only).
+const PACING_BITRATE_MULTIPLIER: f32 = 1.5;
+const SEND_BUFFER_MIN_BYTES: f32 = 32.0 * 1024.0;
+const SEND_BUFFER_MAX_BYTES: f32 = 2.0 * 1024.0 * 1024.0;
 
 pub struct VideoPacket {
     pub header: VideoPacketHeader,
@@ -303,76 +313,77 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
         dbg_connection!("handshake_loop: Try connect to wired device");
 
         let mut wired_client_ips = HashMap::new();
-        if SESSION_MANAGER
-            .read()
-            .client_list()
-            .iter()
-            .any(|(hostname, info)| {
-                info.connection_state == ConnectionState::Disconnected
-                    && hostname.as_str() == WIRED_CLIENT_HOSTNAME
-            })
-        {
-            // Make sure the wired connection is created once and kept alive
-            let wired_connection = if let Some(connection) = &wired_connection {
-                connection
-            } else {
-                let connection = match WiredConnection::new(
-                    FILESYSTEM_LAYOUT.get().unwrap(),
-                    |downloaded, maybe_total| {
-                        if let Some(total) = maybe_total {
-                            alvr_events::send_event(EventType::Adb(AdbEvent {
-                                download_progress: downloaded as f32 / total as f32,
-                            }));
-                        };
-                    },
+        // Wired not ready (no cable, no client, ADB error): fall through to the
+        // wireless paths below instead of skipping them for this iteration.
+        'wired: {
+            if SESSION_MANAGER
+                .read()
+                .client_list()
+                .iter()
+                .any(|(hostname, info)| {
+                    info.connection_state == ConnectionState::Disconnected
+                        && hostname.as_str() == WIRED_CLIENT_HOSTNAME
+                })
+            {
+                // Make sure the wired connection is created once and kept alive
+                let wired_connection = if let Some(connection) = &wired_connection {
+                    connection
+                } else {
+                    let connection = match WiredConnection::new(
+                        FILESYSTEM_LAYOUT.get().unwrap(),
+                        |downloaded, maybe_total| {
+                            if let Some(total) = maybe_total {
+                                alvr_events::send_event(EventType::Adb(AdbEvent {
+                                    download_progress: downloaded as f32 / total as f32,
+                                }));
+                            };
+                        },
+                    ) {
+                        Ok(connection) => connection,
+                        Err(e) => {
+                            error!("{e:?}");
+                            break 'wired;
+                        }
+                    };
+
+                    wired_connection = Some(connection);
+
+                    wired_connection.as_ref().unwrap()
+                };
+
+                let stream_port;
+                let client_type;
+                let client_autolaunch;
+                {
+                    let session_manager_lock = SESSION_MANAGER.read();
+                    let connection = &session_manager_lock.settings().connection;
+                    stream_port = connection.stream_port;
+                    client_type = connection.wired_client_type.clone();
+                    client_autolaunch = connection.wired_client_autolaunch.as_option().cloned();
+                }
+
+                let status = match wired_connection.setup(
+                    (alvr_sockets::wired_control_port(), CONTROL_PORT),
+                    stream_port,
+                    &client_type,
+                    client_autolaunch,
                 ) {
-                    Ok(connection) => connection,
+                    Ok(status) => status,
                     Err(e) => {
                         error!("{e:?}");
-                        thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
-                        continue;
+                        break 'wired;
                     }
                 };
 
-                wired_connection = Some(connection);
-
-                wired_connection.as_ref().unwrap()
-            };
-
-            let stream_port;
-            let client_type;
-            let client_autolaunch;
-            {
-                let session_manager_lock = SESSION_MANAGER.read();
-                let connection = &session_manager_lock.settings().connection;
-                stream_port = connection.stream_port;
-                client_type = connection.wired_client_type.clone();
-                client_autolaunch = connection.wired_client_autolaunch.as_option().cloned();
-            }
-
-            let status = match wired_connection.setup(
-                CONTROL_PORT,
-                stream_port,
-                &client_type,
-                client_autolaunch,
-            ) {
-                Ok(status) => status,
-                Err(e) => {
-                    error!("{e:?}");
-                    thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
-                    continue;
+                #[cfg_attr(not(debug_assertions), expect(unused_variables))]
+                if let WiredConnectionStatus::NotReady(s) = status {
+                    dbg_connection!("handshake_loop: Wired connection not ready: {s}");
+                    break 'wired;
                 }
-            };
 
-            #[cfg_attr(not(debug_assertions), expect(unused_variables))]
-            if let WiredConnectionStatus::NotReady(s) = status {
-                dbg_connection!("handshake_loop: Wired connection not ready: {s}");
-                thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
-                continue;
+                let client_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+                wired_client_ips.insert(client_ip, WIRED_CLIENT_HOSTNAME.to_owned());
             }
-
-            let client_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-            wired_client_ips.insert(client_ip, WIRED_CLIENT_HOSTNAME.to_owned());
         }
 
         if !wired_client_ips.is_empty()
@@ -585,13 +596,19 @@ fn connection_pipeline(
             );
 
             if info.client_protocol_id != alvr_common::protocol_id_u64() {
+                let legacy_test = std::env::var("ALVR_LEGACY_PROTOCOL_TEST")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
                 warn!(
-                    "Trusted client is incompatible! Expected protocol ID: {}, found: {}",
+                    "Trusted client protocol mismatch! Expected protocol ID: {}, found: {}. Legacy test mode: {}",
                     alvr_common::protocol_id_u64(),
                     info.client_protocol_id,
+                    legacy_test,
                 );
-
-                return Ok(());
+                if !legacy_test {
+                    return Ok(());
+                }
+                warn!("TEST ONLY: continuing handshake despite ALVR protocol mismatch");
             }
 
             info.streaming_capabilities
@@ -889,6 +906,8 @@ fn connection_pipeline(
     } else {
         initial_settings.connection.stream_protocol
     };
+    // Pace video shards on UDP (Wi-Fi); TCP (wired) has its own flow control.
+    let pace_video = matches!(stream_protocol, SocketProtocol::Udp);
 
     dbg_connection!("connection_pipeline: Finishing handshake");
     let mut socket = SocketConnection::from_client_connection(
@@ -898,7 +917,16 @@ fn connection_pipeline(
         StreamSocketConfig {
             protocol: stream_protocol,
             port: initial_settings.connection.stream_port,
-            buffer_config: initial_settings.connection.server_buffer_config,
+            // Wired (TCP over ADB): latency-bounding small send buffers only cause false
+            // congestion on stalls; use the maximum. Wireless keeps the configured size.
+            buffer_config: if wired {
+                SocketBufferConfig {
+                    send_size_bytes: SocketBufferSize::Maximum,
+                    ..initial_settings.connection.server_buffer_config.clone()
+                }
+            } else {
+                initial_settings.connection.server_buffer_config.clone()
+            },
             max_packet_size: initial_settings.connection.packet_size as _,
             dscp: initial_settings.connection.dscp,
         },
@@ -935,21 +963,84 @@ fn connection_pipeline(
     let mut statics_receiver =
         socket.subscribe_to_unreliable_stream::<ClientStatistics>(STATISTICS, MAX_UNREAD_PACKETS);
 
-    let (video_channel_sender, video_channel_receiver) =
-        std::sync::mpsc::sync_channel(initial_settings.connection.max_queued_server_video_frames);
+    // Wired links stall briefly (ADB scheduling) but have ample throughput: a deeper queue
+    // absorbs that instead of dropping frames and cutting the bitrate.
+    let video_queue_frames = if wired {
+        initial_settings.connection.max_queued_server_video_frames.max(WIRED_MIN_QUEUED_VIDEO_FRAMES)
+    } else {
+        initial_settings.connection.max_queued_server_video_frames
+    };
+    let (video_channel_sender, video_channel_receiver) = std::sync::mpsc::sync_channel(video_queue_frames);
     *ctx.video_channel_sender.lock() = Some(video_channel_sender);
+    eprintln!(
+        "[INTEL-XR-CONNECTION-RAW] VIDEO_CHANNEL_INSTALL ctx={:p}",
+        Arc::as_ptr(&ctx)
+    );
+    // The encoder may have produced its startup IDR before the stream socket
+    // existed. Once the video transport is installed, explicitly request a
+    // fresh keyframe so the client can bootstrap from a valid IDR.
+    let idr_request_ok = ctx.events_sender.send(ServerCoreEvent::RequestIDR).is_ok();
+    eprintln!(
+        "[INTEL-XR-CONNECTION-RAW] REQUEST_IDR_AFTER_VIDEO_READY ok={}",
+        idr_request_ok
+    );
     *ctx.haptics_sender.lock() = Some(haptics_sender);
 
     let video_send_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         let client_hostname = client_hostname.clone();
         move || {
+            let mut intel_xr_video_packet_sent_logged = false;
+            let mut intel_xr_video_sent_count: u64 = 0;
+            let mut intel_xr_video_send_errors: u64 = 0;
+            // Keep the kernel send buffer at a few frames of the current bitrate so a
+            // congested link queues ~SEND_BUFFER_FRAMES frame-times, not seconds (UDP only).
+            let mut last_send_buffer_check = Instant::now();
+            let mut applied_send_buffer_bytes = 0_usize;
             while is_streaming(&client_hostname) {
+                if last_send_buffer_check.elapsed() >= Duration::from_secs(1) {
+                    last_send_buffer_check = Instant::now();
+                    let (bitrate_bps, framerate) = {
+                        let manager = ctx.bitrate_manager.lock();
+                        (manager.last_requested_bitrate_bps(), manager.nominal_framerate())
+                    };
+                    if bitrate_bps > 0.0 && framerate > 0.0 {
+                        let target = (bitrate_bps / 8.0 / framerate * SEND_BUFFER_FRAMES)
+                            .clamp(SEND_BUFFER_MIN_BYTES, SEND_BUFFER_MAX_BYTES)
+                            as usize;
+                        let differs = applied_send_buffer_bytes == 0
+                            || target.abs_diff(applied_send_buffer_bytes) * 5
+                                > applied_send_buffer_bytes;
+                        if pace_video {
+                            video_sender.set_pacing(Some(bitrate_bps * PACING_BITRATE_MULTIPLIER));
+                        }
+                        if differs {
+                            applied_send_buffer_bytes = target;
+                            match video_sender.set_send_buffer_size(target) {
+                                Ok(0) => (),
+                                Ok(actual) => info!(
+                                    "[INTEL-XR-SERVER] SEND_BUFFER_RESIZE target={target} kernel={actual} bitrate_bps={bitrate_bps}"
+                                ),
+                                Err(e) => warn!("Failed to resize video send buffer: {e}"),
+                            }
+                        }
+                    }
+                }
+
                 let VideoPacket {
                     mut header,
                     payload,
                 } = match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
-                    Ok(packet) => packet,
+                    Ok(packet) => {
+                        if !intel_xr_video_packet_sent_logged {
+                            info!(
+                                "[INTEL-XR-SERVER] VIDEO_CHANNEL_DEQUEUE bytes={} idr={}",
+                                packet.payload.len(),
+                                packet.header.is_idr
+                            );
+                        }
+                        packet
+                    },
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => return,
                 };
@@ -959,9 +1050,36 @@ fn connection_pipeline(
                     .unrecenter_view_params(&mut header.global_view_params);
 
                 // todo: use get_buffer and make encoder write to socket buffers directly to avoid copy
-                video_sender
-                    .send_header_with_payload(&header, &payload)
-                    .ok();
+                let payload_len = payload.len();
+                let is_idr = header.is_idr;
+                // A failed shard aborts the rest of the packet, so surface send
+                // errors (rate-limited) instead of discarding them.
+                let send_result = video_sender.send_header_with_payload(&header, &payload);
+                match &send_result {
+                    Ok(()) => intel_xr_video_sent_count += 1,
+                    Err(e) => {
+                        intel_xr_video_send_errors += 1;
+                        if intel_xr_video_send_errors <= 20 || intel_xr_video_send_errors % 500 == 0 {
+                            warn!(
+                                "[INTEL-XR-SERVER] VIDEO_PACKET_SEND_ERROR count={} bytes={} idr={} err={e}",
+                                intel_xr_video_send_errors, payload_len, is_idr
+                            );
+                        }
+                    }
+                }
+                if (intel_xr_video_sent_count + intel_xr_video_send_errors) % 500 == 0 {
+                    info!(
+                        "[INTEL-XR-SERVER] VIDEO_SEND_STATS sent={} errors={}",
+                        intel_xr_video_sent_count, intel_xr_video_send_errors
+                    );
+                }
+                if send_result.is_ok() && !intel_xr_video_packet_sent_logged {
+                    info!(
+                        "[INTEL-XR-SERVER] VIDEO_PACKET_SENT bytes={} idr={}",
+                        payload_len, is_idr
+                    );
+                    intel_xr_video_packet_sent_logged = true;
+                }
             }
         }
     });
@@ -1242,6 +1360,9 @@ fn connection_pipeline(
         let client_hostname = client_hostname.clone();
         move || {
             let mut disconnection_deadline = Instant::now() + KEEPALIVE_TIMEOUT;
+            // The client asks for an IDR on every lost/skipped packet while it waits;
+            // forward (and resend the decoder config) at most once per interval.
+            let mut last_client_idr_request: Option<Instant> = None;
             while is_streaming(&client_hostname) {
                 let packet = match control_receiver.recv(STREAMING_RECV_TIMEOUT) {
                     Ok(packet) => packet,
@@ -1283,12 +1404,27 @@ fn connection_pipeline(
                             }
                         }
                     }
+                    ClientControlPacket::RequestIdr
+                        if last_client_idr_request.is_some_and(|last| {
+                            Instant::now() < last + CLIENT_IDR_REQUEST_MIN_INTERVAL
+                        }) => {}
                     ClientControlPacket::RequestIdr => {
+                        last_client_idr_request = Some(Instant::now());
                         if let Some(config) = ctx.decoder_config.lock().clone() {
-                            control_sender
+                            let codec = config.codec;
+                            let config_bytes = config.config_buffer.len();
+                            if control_sender
                                 .lock()
                                 .send(&ServerControlPacket::DecoderConfig(config))
-                                .ok();
+                                .is_ok()
+                            {
+                                info!(
+                                    "[INTEL-XR-SERVER] DECODER_CONFIG_SENT codec={:?} bytes={}",
+                                    codec, config_bytes
+                                );
+                            }
+                        } else {
+                            info!("[INTEL-XR-SERVER] DECODER_CONFIG_UNAVAILABLE_ON_IDR_REQUEST");
                         }
                         ctx.events_sender.send(ServerCoreEvent::RequestIDR).ok();
                     }
@@ -1409,16 +1545,29 @@ fn connection_pipeline(
         let disconnect_notif = Arc::clone(&disconnect_notif);
         let client_hostname = client_hostname.clone();
         move || {
-            while SESSION_MANAGER
-                .read()
-                .client_list()
-                .get(&client_hostname)
-                .is_some_and(|c| c.connection_state == ConnectionState::Streaming)
-                && *lifecycle_state.read() == LifecycleState::Resumed
-            {
+            loop {
+                let client_streaming = SESSION_MANAGER
+                    .read()
+                    .client_list()
+                    .get(&client_hostname)
+                    .is_some_and(|c| c.connection_state == ConnectionState::Streaming);
+                let lifecycle = lifecycle_state.read();
+                let lifecycle_resumed = *lifecycle == LifecycleState::Resumed;
+
+                if !(client_streaming && lifecycle_resumed) {
+                    eprintln!(
+                        "[INTEL-XR-CONNECTION-RAW] SHUTDOWN_TRIGGER client_streaming={} lifecycle={:?} lifecycle_resumed={}",
+                        client_streaming,
+                        &*lifecycle,
+                        lifecycle_resumed
+                    );
+                    break;
+                }
+
                 thread::sleep(STREAMING_RECV_TIMEOUT);
             }
 
+            eprintln!("[INTEL-XR-CONNECTION-RAW] DISCONNECT_NOTIFY");
             disconnect_notif.notify_one()
         }
     });
@@ -1441,6 +1590,10 @@ fn connection_pipeline(
         crate::create_recording_file(&ctx, session_manager_lock.settings());
     }
 
+    eprintln!(
+        "[INTEL-XR-CONNECTION-RAW] MARK_STREAMING ctx={:p}",
+        Arc::as_ptr(&ctx)
+    );
     session_manager_lock.update_client_connections(
         client_hostname.clone(),
         ClientConnectionsAction::SetConnectionState(ConnectionState::Streaming),
@@ -1467,6 +1620,10 @@ fn connection_pipeline(
     dbg_connection!("connection_pipeline: Begin connection shutdown");
 
     // This requests shutdown from threads
+    eprintln!(
+        "[INTEL-XR-CONNECTION-RAW] VIDEO_CHANNEL_REMOVE ctx={:p}",
+        Arc::as_ptr(&ctx)
+    );
     *ctx.video_channel_sender.lock() = None;
     *ctx.haptics_sender.lock() = None;
 

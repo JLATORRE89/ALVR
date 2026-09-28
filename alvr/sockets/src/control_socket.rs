@@ -199,7 +199,13 @@ impl ProtoControlSocket {
     pub fn connect_to(timeout: Duration, peer: PeerType<'_>) -> ConResult<(Self, IpAddr)> {
         let socket = match peer {
             PeerType::AnyClient(ips) => {
-                connect_to_client(timeout, &ips, CONTROL_PORT, SocketBufferConfig::default())?.0
+                // Wired clients are reached through a local ADB forward (per-instance port).
+                let port = if !ips.is_empty() && ips.iter().all(|ip| ip.is_loopback()) {
+                    crate::wired_control_port()
+                } else {
+                    CONTROL_PORT
+                };
+                connect_to_client(timeout, &ips, port, SocketBufferConfig::default())?.0
             }
             PeerType::Server(listener) => accept_from_server(listener, None, timeout)?.0,
         };

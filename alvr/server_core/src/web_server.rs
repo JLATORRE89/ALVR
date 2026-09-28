@@ -121,7 +121,8 @@ pub async fn web_server(connection_context: Arc<ConnectionContext>) -> Result<()
                     "/version",
                     routing::get(async || alvr_common::ALVR_VERSION.to_string()),
                 )
-                .route("/ping", routing::get(async || ())),
+                .route("/ping", routing::get(async || ()))
+                .route("/xr/clients", routing::get(get_xr_clients)),
         )
         .layer(cors)
         .layer(SetResponseHeaderLayer::overriding(
@@ -294,4 +295,13 @@ async fn set_buttons(
     ctx.events_sender
         .send(ServerCoreEvent::Buttons(button_entries))
         .ok();
+}
+
+async fn get_xr_clients() -> Json<serde_json::Value> {
+    let session = SESSION_MANAGER.read();
+    Json(serde_json::json!({
+        "auto_accept": session.settings().connection.client_discovery
+            .as_option().map(|c| c.auto_trust_clients).unwrap_or(false),
+        "clients": session.client_list(),
+    }))
 }

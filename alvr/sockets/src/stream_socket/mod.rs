@@ -41,6 +41,16 @@ trait MultiplexedSocketWriter {
     fn payload_offset(&self) -> usize;
 
     fn send(&mut self, stream_id: u16, packet_index: u32, buffer: &mut Vec<u8>) -> Result<()>;
+
+    // Pace the shards of one stream at bits_per_sec (None: back-to-back). Only UDP paces; TCP has
+    // its own flow control.
+    fn set_pacing(&mut self, _stream_id: u16, _bits_per_sec: Option<f32>) {}
+
+    // Resize the kernel send buffer at runtime. Returns the size the kernel reports (0 if the
+    // backend does not support resizing).
+    fn set_send_buffer_size(&mut self, _bytes: usize) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 struct ReconstructedPacket {
@@ -93,6 +103,19 @@ pub struct StreamSender<H> {
 }
 
 impl<H> StreamSender<H> {
+    /// Pace this stream's shards at bits_per_sec (None: send back-to-back).
+    pub fn set_pacing(&self, bits_per_sec: Option<f32>) {
+        self.inner
+            .lock()
+            .set_pacing(self.stream_id, bits_per_sec.filter(|rate| *rate > 0.0));
+    }
+
+    /// Resize the kernel send buffer (UDP). Returns the size reported by the kernel, or 0 if
+    /// unsupported by the backend.
+    pub fn set_send_buffer_size(&self, bytes: usize) -> Result<usize> {
+        self.inner.lock().set_send_buffer_size(bytes)
+    }
+
     /// Shard and send a buffer with zero copies and zero allocations.
     /// The prefix of each shard is written over the previously sent shard to avoid reallocations.
     pub fn send(&mut self, mut buffer: Buffer<H>) -> Result<()> {

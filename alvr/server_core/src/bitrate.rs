@@ -10,6 +10,12 @@ use std::{
 };
 
 const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+// Send-path congestion (video channel full): multiplicative decrease, then slow recovery.
+const CONGESTION_DECREASE_FACTOR: f32 = 0.7;
+const CONGESTION_MIN_INTERVAL: Duration = Duration::from_millis(500);
+const CONGESTION_HOLD: Duration = Duration::from_secs(2);
+const CONGESTION_RECOVERY_FACTOR: f32 = 1.05;
+const CONGESTION_MIN_BITRATE_BPS: f32 = 2e6;
 
 pub struct DynamicEncoderParams {
     pub bitrate_bps: f32,
@@ -31,6 +37,11 @@ pub struct BitrateManager {
     dynamic_decoder_max_bytes_per_frame: f32,
     previous_config: Option<BitrateConfig>,
     update_needed: bool,
+    // Upper bound applied after send-path congestion; None when not congested.
+    congestion_cap_bps: Option<f32>,
+    last_congestion_instant: Instant,
+    last_cap_update_instant: Instant,
+    last_requested_bitrate_bps: f32,
 }
 
 impl BitrateManager {
@@ -57,6 +68,41 @@ impl BitrateManager {
             dynamic_decoder_max_bytes_per_frame: f32::MAX,
             previous_config: None,
             update_needed: true,
+            congestion_cap_bps: None,
+            last_congestion_instant: Instant::now(),
+            last_cap_update_instant: Instant::now(),
+            last_requested_bitrate_bps: 0.0,
+        }
+    }
+
+    pub fn last_requested_bitrate_bps(&self) -> f32 {
+        self.last_requested_bitrate_bps
+    }
+
+    pub fn nominal_framerate(&self) -> f32 {
+        1.0 / self.nominal_frame_interval.as_secs_f32()
+    }
+
+    // Called when an encoded frame cannot be queued for the network (video channel full).
+    // Clients only report statistics for frames they receive, so without this a saturated
+    // link produces no feedback and the bitrate never comes down.
+    pub fn report_send_congestion(&mut self) {
+        let now = Instant::now();
+        if now < self.last_congestion_instant + CONGESTION_MIN_INTERVAL {
+            return;
+        }
+        self.last_congestion_instant = now;
+        self.last_cap_update_instant = now;
+
+        let base = self
+            .congestion_cap_bps
+            .unwrap_or(self.last_requested_bitrate_bps);
+        if base > 0.0 {
+            self.congestion_cap_bps = Some(f32::max(
+                base * CONGESTION_DECREASE_FACTOR,
+                CONGESTION_MIN_BITRATE_BPS,
+            ));
+            self.update_needed = true;
         }
     }
 
@@ -157,6 +203,8 @@ impl BitrateManager {
             self.previous_config = Some(config.clone());
             // Continue method. Always update bitrate in this case
         } else if !self.update_needed
+            && !(self.congestion_cap_bps.is_some()
+                && now >= self.last_cap_update_instant + UPDATE_INTERVAL)
             && (now < self.last_update_instant + UPDATE_INTERVAL
                 || matches!(config.mode, BitrateMode::ConstantMbps(_)))
         {
@@ -174,7 +222,7 @@ impl BitrateManager {
 
         let mut bitrate_directives = BitrateDirectives::default();
 
-        let bitrate_bps = match &config.mode {
+        let mut bitrate_bps = match &config.mode {
             BitrateMode::ConstantMbps(bitrate_mbps) => *bitrate_mbps as f32 * 1e6,
             BitrateMode::Adaptive {
                 saturation_multiplier,
@@ -240,6 +288,21 @@ impl BitrateManager {
                 throughput_bps
             }
         };
+
+        if let Some(mut cap) = self.congestion_cap_bps {
+            // Evaluated at most once per UPDATE_INTERVAL (see the early return above).
+            if now >= self.last_congestion_instant + CONGESTION_HOLD {
+                cap *= CONGESTION_RECOVERY_FACTOR;
+            }
+            self.last_cap_update_instant = now;
+            if cap >= bitrate_bps {
+                self.congestion_cap_bps = None;
+            } else {
+                self.congestion_cap_bps = Some(cap);
+                bitrate_bps = cap;
+            }
+        }
+        self.last_requested_bitrate_bps = bitrate_bps;
 
         bitrate_directives.requested_bitrate_bps = bitrate_bps;
 

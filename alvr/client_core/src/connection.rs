@@ -191,6 +191,7 @@ fn connection_pipeline(
     let config_packet =
         proto_control_socket.recv::<StreamConfigPacket>(HANDSHAKE_ACTION_TIMEOUT)?;
     dbg_connection!("connection_pipeline: stream config received");
+    info!("[INTEL-XR-VIDEO] STREAM_CONFIG_RECEIVED");
 
     let stream_config = config_packet.to_stream_config().to_con()?;
 
@@ -212,6 +213,7 @@ fn connection_pipeline(
     match control_receiver.recv(HANDSHAKE_ACTION_TIMEOUT) {
         Ok(ServerControlPacket::StartStream) => {
             info!("Stream starting");
+            info!("[INTEL-XR-VIDEO] START_STREAM_RECEIVED");
             set_hud_message(&event_queue, STREAM_STARTING_MESSAGE);
         }
         Ok(ServerControlPacket::Restarting) => {
@@ -263,17 +265,29 @@ fn connection_pipeline(
     )?;
 
     info!("Connected to server");
+    info!("[INTEL-XR-VIDEO] STREAM_SOCKET_CONNECTED");
 
+    info!("[INTEL-XR-VIDEO] SUBSCRIBE_VIDEO_BEGIN");
     let mut video_receiver =
         stream_socket.subscribe_to_stream::<VideoPacketHeader>(VIDEO, MAX_UNREAD_PACKETS);
+    info!("[INTEL-XR-VIDEO] SUBSCRIBE_VIDEO_OK");
+    info!("[INTEL-XR-VIDEO] SUBSCRIBE_AUDIO_BEGIN");
     let mut game_audio_receiver = stream_socket.subscribe_to_stream(AUDIO, MAX_UNREAD_PACKETS);
+    info!("[INTEL-XR-VIDEO] SUBSCRIBE_AUDIO_OK");
+    info!("[INTEL-XR-VIDEO] TRACKING_STREAM_BEGIN");
     let tracking_sender = stream_socket.request_stream(TRACKING);
+    info!("[INTEL-XR-VIDEO] TRACKING_STREAM_OK");
+    info!("[INTEL-XR-VIDEO] SUBSCRIBE_HAPTICS_BEGIN");
     let mut haptics_receiver =
         stream_socket.subscribe_to_stream::<Haptics>(HAPTICS, MAX_UNREAD_PACKETS);
+    info!("[INTEL-XR-VIDEO] SUBSCRIBE_HAPTICS_OK");
+    info!("[INTEL-XR-VIDEO] STATISTICS_STREAM_BEGIN");
     let statistics_sender = stream_socket.request_stream(STATISTICS);
+    info!("[INTEL-XR-VIDEO] STATISTICS_STREAM_OK");
 
     ctx.video_frame_metadata_queue.lock().clear();
 
+    info!("[INTEL-XR-VIDEO] VIDEO_THREAD_SPAWN_BEGIN");
     let video_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         move || {
@@ -285,14 +299,17 @@ fn connection_pipeline(
                     Err(ConnectionError::Other(_)) => return,
                 };
                 let Ok((header, nal)) = data.get() else {
+                    error!("[INTEL-XR-VIDEO] VIDEO_PACKET_PARSE_FAILED");
                     return;
                 };
+                info!("[INTEL-XR-VIDEO] VIDEO_PACKET_RECEIVED bytes={} idr={} loss={}", nal.len(), header.is_idr, data.had_packet_loss());
 
                 if let Some(stats) = &mut *ctx.statistics_manager.lock() {
                     stats.report_video_packet_received(header.timestamp);
                 }
 
                 if header.is_idr {
+                    info!("[INTEL-XR-VIDEO] IDR_RECEIVED bytes={}", nal.len());
                     stream_corrupted = false;
                 } else if data.had_packet_loss() {
                     stream_corrupted = true;
@@ -319,13 +336,22 @@ fn connection_pipeline(
                         }
                     }
 
-                    let submitted = ctx
-                        .decoder_callback
-                        .lock()
+                    let mut callback_lock = ctx.decoder_callback.lock();
+                    let callback_present = callback_lock.is_some();
+                    info!("[INTEL-XR-VIDEO] DECODER_CALLBACK present={callback_present}");
+                    let submitted = callback_lock
                         .as_mut()
                         .is_some_and(|callback| callback(header.timestamp, nal));
+                    info!("[INTEL-XR-VIDEO] DECODER_SUBMIT accepted={submitted} bytes={}", nal.len());
 
-                    if !submitted {
+                    if submitted {
+                        let view_params_lock = &mut *ctx.global_view_params_queue.lock();
+                        view_params_lock.push_back((header.timestamp, header.global_view_params));
+
+                        if view_params_lock.len() > 1024 {
+                            view_params_lock.pop_front();
+                        }
+                    } else {
                         stream_corrupted = true;
                         if let Some(sender) = &mut *ctx.control_sender.lock() {
                             sender.send(&ClientControlPacket::RequestIdr).ok();
@@ -342,8 +368,13 @@ fn connection_pipeline(
         }
     });
 
+    info!("[INTEL-XR-VIDEO] VIDEO_THREAD_SPAWNED");
+    info!("[INTEL-XR-VIDEO] AUDIO_INIT_BEGIN enabled={}", matches!(settings.audio.game_audio, Switch::Enabled(_)));
     let game_audio_thread = if let Switch::Enabled(config) = settings.audio.game_audio {
-        let device = alvr_audio::new_output(None).to_con()?;
+        let device = match alvr_audio::new_output(None).to_con() {
+            Ok(device) => { info!("[INTEL-XR-VIDEO] AUDIO_DEVICE_OK"); device },
+            Err(e) => { error!("[INTEL-XR-VIDEO] AUDIO_DEVICE_FAILED {e}"); return Err(e); }
+        };
         thread::spawn({
             let ctx = Arc::clone(&ctx);
             move || {
@@ -363,6 +394,8 @@ fn connection_pipeline(
         thread::spawn(|| ())
     };
 
+    info!("[INTEL-XR-VIDEO] AUDIO_THREAD_READY");
+    info!("[INTEL-XR-VIDEO] MICROPHONE_INIT_BEGIN enabled={}", matches!(settings.audio.microphone, Switch::Enabled(_)));
     let microphone_thread = if matches!(settings.audio.microphone, Switch::Enabled(_)) {
         let device = alvr_audio::new_input(None).to_con()?;
 
@@ -394,6 +427,8 @@ fn connection_pipeline(
         thread::spawn(|| ())
     };
 
+    info!("[INTEL-XR-VIDEO] MICROPHONE_THREAD_READY");
+    info!("[INTEL-XR-VIDEO] HAPTICS_THREAD_SPAWN_BEGIN");
     let haptics_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         let event_queue = Arc::clone(&event_queue);
@@ -418,8 +453,11 @@ fn connection_pipeline(
         }
     });
 
+    info!("[INTEL-XR-VIDEO] HAPTICS_THREAD_SPAWNED");
     let (log_channel_sender, log_channel_receiver) = mpsc::channel();
+    info!("[INTEL-XR-VIDEO] LOG_CHANNEL_READY");
 
+    info!("[INTEL-XR-VIDEO] CONTROL_SEND_THREAD_SPAWN_BEGIN");
     let control_send_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         let event_queue = Arc::clone(&event_queue);
@@ -470,6 +508,8 @@ fn connection_pipeline(
         }
     });
 
+    info!("[INTEL-XR-VIDEO] CONTROL_SEND_THREAD_SPAWNED");
+    info!("[INTEL-XR-VIDEO] CONTROL_RECEIVE_THREAD_SPAWN_BEGIN");
     let control_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         let event_queue = Arc::clone(&event_queue);
@@ -481,6 +521,7 @@ fn connection_pipeline(
 
                 match maybe_packet {
                     Ok(ServerControlPacket::DecoderConfig(config)) => {
+                        info!("[INTEL-XR-VIDEO] CONTROL_DECODER_CONFIG codec={:?} bytes={}", config.codec, config.config_buffer.len());
                         event_queue
                             .lock()
                             .push_back(ClientCoreEvent::DecoderConfig {
@@ -526,38 +567,69 @@ fn connection_pipeline(
         }
     });
 
+    info!("[INTEL-XR-VIDEO] CONTROL_RECEIVE_THREAD_SPAWNED");
+    info!("[INTEL-XR-VIDEO] STREAM_RECEIVE_THREAD_SPAWN_BEGIN");
     let stream_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         let event_queue = Arc::clone(&event_queue);
         let disconnect_notif = Arc::clone(&disconnect_notif);
         move || {
+            // Heartbeat: shards processed vs TryAgain. ~2 TryAgain/s with no shards means
+            // nothing arrives; a hot TryAgain spin with no shards means a peeked datagram
+            // is never consumed; shards without VIDEO_PACKET_RECEIVED means reassembly fails.
+            let mut intel_xr_shards: u64 = 0;
+            let mut intel_xr_try_again: u64 = 0;
+            let mut intel_xr_last_report = Instant::now();
             while is_streaming(&ctx) {
                 match stream_socket.recv() {
-                    Ok(()) => (),
-                    Err(ConnectionError::TryAgain(_)) => continue,
+                    Ok(()) => intel_xr_shards += 1,
+                    Err(ConnectionError::TryAgain(_)) => intel_xr_try_again += 1,
                     Err(e) => {
                         info!("Client disconnected. Cause: {e}");
                         set_hud_message(&event_queue, SERVER_DISCONNECTED_MESSAGE);
                         disconnect_notif.notify_one();
                     }
                 }
+                if intel_xr_last_report.elapsed() >= Duration::from_secs(2) {
+                    info!(
+                        "[INTEL-XR-VIDEO] STREAM_RECV_STATS shards={intel_xr_shards} try_again={intel_xr_try_again}"
+                    );
+                    intel_xr_last_report = Instant::now();
+                }
             }
         }
     });
 
+    info!("[INTEL-XR-VIDEO] STREAM_RECEIVE_THREAD_SPAWNED");
+    info!("[INTEL-XR-VIDEO] INSTALL_SENDERS_BEGIN");
+
+    info!("[INTEL-XR-VIDEO] INSTALL_CONTROL_SENDER_BEGIN");
     *ctx.control_sender.lock() = Some(control_sender);
+    info!("[INTEL-XR-VIDEO] INSTALL_CONTROL_SENDER_OK");
+
+    info!("[INTEL-XR-VIDEO] INSTALL_TRACKING_SENDER_BEGIN");
     *ctx.tracking_sender.lock() = Some(tracking_sender);
+    info!("[INTEL-XR-VIDEO] INSTALL_TRACKING_SENDER_OK");
+
+    info!("[INTEL-XR-VIDEO] INSTALL_STATISTICS_SENDER_BEGIN");
     *ctx.statistics_sender.lock() = Some(statistics_sender);
-    if let Switch::Enabled(filter_level) = settings.extra.logging.client_log_report_level {
-        *LOG_CHANNEL_SENDER.lock() = Some(LogMirrorData {
-            sender: log_channel_sender,
-            filter_level,
-            debug_groups_config: settings.extra.logging.debug_groups,
-        });
-    }
+    info!("[INTEL-XR-VIDEO] INSTALL_STATISTICS_SENDER_OK");
+    // IMPORTANT: do not emit a log record while holding LOG_CHANNEL_SENDER.
+    // The logger itself calls send_log(), which locks LOG_CHANNEL_SENDER. Logging from
+    // inside this critical section therefore self-deadlocks as soon as mirroring is enabled.
+    let log_mirror_enabled =
+        matches!(settings.extra.logging.client_log_report_level, Switch::Enabled(_));
+    info!("[INTEL-XR-VIDEO] LOG_MIRROR_BYPASSED enabled={log_mirror_enabled}");
+    // Diagnostic build: leave LOG_CHANNEL_SENDER unset. Enabling it here can deadlock the
+    // Android logging callback because send_log() itself acquires LOG_CHANNEL_SENDER.
+    // Client logs still go to logcat, which is what this diagnostic build needs.
+    let _ = log_channel_sender;
+    info!("[INTEL-XR-VIDEO] INSTALL_SENDERS_OK");
     event_queue.lock().push_back(streaming_start_event);
+    info!("[INTEL-XR-VIDEO] STREAMING_EVENT_QUEUED");
 
     *connection_state_lock = ConnectionState::Streaming;
+    info!("[INTEL-XR-VIDEO] CONNECTION_STATE_STREAMING");
 
     dbg_connection!("connection_pipeline: Unlock streams");
 

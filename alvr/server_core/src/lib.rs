@@ -18,7 +18,7 @@ pub use tracking::HandType;
 use crate::connection::VideoPacket;
 use alvr_common::{
     AlvrFoveatedEncodingParams, ConnectionState, DEVICE_ID_TO_PATH, DeviceMotion, LifecycleState,
-    Pose, ViewParams, dbg_server_core, error,
+    Pose, ViewParams, dbg_server_core, error, info,
     glam::{Quat, UVec2, Vec2},
     parking_lot::{Mutex, RwLock},
     settings_schema::Switch,
@@ -280,6 +280,22 @@ impl ServerCoreContext {
             .get_device_motion(device_id, sample_timestamp)
     }
 
+    pub fn get_predicted_device_motion(
+        &self,
+        device_id: u64,
+        sample_timestamp: Duration,
+        target_timestamp: Duration,
+    ) -> Option<DeviceMotion> {
+        dbg_server_core!(
+            "get_predicted_device_motion: dev={device_id} sample_ts={sample_timestamp:?} target_ts={target_timestamp:?}"
+        );
+
+        self.connection_context
+            .tracking_manager
+            .read()
+            .get_predicted_device_motion(device_id, sample_timestamp, target_timestamp)
+    }
+
     pub fn get_hand_skeleton(
         &self,
         hand_type: HandType,
@@ -377,6 +393,11 @@ impl ServerCoreContext {
 
     pub fn set_video_config_nals(&self, config_buffer: Vec<u8>, codec: CodecType) {
         dbg_server_core!("set_video_config_nals");
+        info!(
+            "[INTEL-XR-SERVER] DECODER_CONFIG_STORED codec={:?} bytes={}",
+            codec,
+            config_buffer.len()
+        );
 
         if let Some(sender) = &*self.connection_context.video_mirror_sender.lock() {
             sender.send(config_buffer.clone()).ok();
@@ -402,13 +423,44 @@ impl ServerCoreContext {
         nal_buffer: Vec<u8>,
     ) {
         dbg_server_core!("send_video_nal");
+        static INTEL_XR_VIDEO_NAL_ENTER_LOGGED: AtomicBool = AtomicBool::new(false);
+        let intel_xr_first_video_nal =
+            !INTEL_XR_VIDEO_NAL_ENTER_LOGGED.swap(true, Ordering::SeqCst);
+        if intel_xr_first_video_nal {
+            eprintln!(
+                "[INTEL-XR-SERVER-RAW] VIDEO_NAL_ENTER bytes={} idr={} ts_ns={}",
+                nal_buffer.len(),
+                is_idr,
+                timestamp.as_nanos()
+            );
+            info!(
+                "[INTEL-XR-SERVER] VIDEO_NAL_ENTER bytes={} idr={} ts_ns={}",
+                nal_buffer.len(),
+                is_idr,
+                timestamp.as_nanos()
+            );
+        }
 
         // start in the corrupts state, the client didn't receive the initial IDR yet.
         static STREAM_CORRUPTED: AtomicBool = AtomicBool::new(true);
         static LAST_IDR_INSTANT: LazyLock<Mutex<Instant>> =
             LazyLock::new(|| Mutex::new(Instant::now()));
 
-        if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
+        if intel_xr_first_video_nal {
+            eprintln!("[INTEL-XR-SERVER-RAW] VIDEO_CHANNEL_LOCK_BEGIN");
+        }
+        let video_channel_lock = self.connection_context.video_channel_sender.lock();
+        if intel_xr_first_video_nal {
+            eprintln!(
+                "[INTEL-XR-SERVER-RAW] VIDEO_CHANNEL_LOCK_OK present={}",
+                video_channel_lock.is_some()
+            );
+        }
+        if let Some(sender) = &*video_channel_lock {
+            static INTEL_XR_VIDEO_CHANNEL_READY_LOGGED: AtomicBool = AtomicBool::new(false);
+            if !INTEL_XR_VIDEO_CHANNEL_READY_LOGGED.swap(true, Ordering::SeqCst) {
+                info!("[INTEL-XR-SERVER] VIDEO_CHANNEL_READY");
+            }
             let buffer_size = nal_buffer.len();
 
             if is_idr {
@@ -453,6 +505,9 @@ impl ServerCoreContext {
                     file.write_all(&nal_buffer).ok();
                 }
 
+                if intel_xr_first_video_nal {
+                    eprintln!("[INTEL-XR-SERVER-RAW] VIDEO_CHANNEL_TRY_SEND_BEGIN");
+                }
                 let sender_result = sender.try_send(VideoPacket {
                     header: VideoPacketHeader {
                         timestamp,
@@ -462,12 +517,32 @@ impl ServerCoreContext {
                     },
                     payload: nal_buffer,
                 });
+                if intel_xr_first_video_nal {
+                    eprintln!(
+                        "[INTEL-XR-SERVER-RAW] VIDEO_CHANNEL_TRY_SEND_RESULT ok={}",
+                        sender_result.is_ok()
+                    );
+                }
+                static INTEL_XR_VIDEO_ENQUEUE_LOGGED: AtomicBool = AtomicBool::new(false);
+                if sender_result.is_ok()
+                    && !INTEL_XR_VIDEO_ENQUEUE_LOGGED.swap(true, Ordering::SeqCst)
+                {
+                    info!("[INTEL-XR-SERVER] VIDEO_CHANNEL_ENQUEUE");
+                }
                 if matches!(sender_result, Err(TrySendError::Full(_))) {
-                    STREAM_CORRUPTED.store(true, Ordering::SeqCst);
+                    // Request one IDR when the stream becomes corrupted, or when the
+                    // dropped frame was itself the recovery IDR; not on every drop.
+                    let was_corrupted = STREAM_CORRUPTED.swap(true, Ordering::SeqCst);
+                    if !was_corrupted || is_idr {
+                        self.connection_context
+                            .events_sender
+                            .send(ServerCoreEvent::RequestIDR)
+                            .ok();
+                    }
                     self.connection_context
-                        .events_sender
-                        .send(ServerCoreEvent::RequestIDR)
-                        .ok();
+                        .bitrate_manager
+                        .lock()
+                        .report_send_congestion();
                     warn!("Dropping video packet. Reason: Can't push to network");
                 }
             } else {
@@ -481,6 +556,11 @@ impl ServerCoreContext {
                     .bitrate_manager
                     .lock()
                     .report_frame_encoded(timestamp, encoder_latency, buffer_size);
+            }
+        } else {
+            static INTEL_XR_VIDEO_CHANNEL_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
+            if !INTEL_XR_VIDEO_CHANNEL_MISSING_LOGGED.swap(true, Ordering::SeqCst) {
+                info!("[INTEL-XR-SERVER] VIDEO_CHANNEL_MISSING");
             }
         }
     }

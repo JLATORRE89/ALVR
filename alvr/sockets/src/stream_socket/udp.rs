@@ -57,9 +57,19 @@ pub fn connect(socket: &UdpSocket, peer_ip: IpAddr, port: u16, timeout: Duration
     Ok(())
 }
 
+// Burst allowance for shard pacing: up to this much sending "credit" can accumulate.
+const PACING_BURST: Duration = Duration::from_millis(2);
+
+struct Pacing {
+    bits_per_sec: f32,
+    next_shard: std::time::Instant,
+}
+
 pub struct MultiplexedUdpWriter {
     inner: UdpSocket,
     max_packet_size: usize,
+    // Per-stream shard pacing (token bucket) so whole frames are not burst onto slow links.
+    pacing: HashMap<u16, Pacing>,
 }
 
 impl MultiplexedSocketWriter for MultiplexedUdpWriter {
@@ -86,10 +96,48 @@ impl MultiplexedSocketWriter for MultiplexedUdpWriter {
             shard_view[6..10].copy_from_slice(&(shards_count as u32).to_le_bytes());
             shard_view[10..14].copy_from_slice(&(shard_idx as u32).to_le_bytes());
 
+            if let Some(pacing) = self.pacing.get_mut(&stream_id) {
+                // Allow a small burst, then space shards at the configured rate.
+                let now = std::time::Instant::now();
+                let burst_floor = now.checked_sub(PACING_BURST).unwrap_or(now);
+                if pacing.next_shard < burst_floor {
+                    pacing.next_shard = burst_floor;
+                }
+                if pacing.next_shard > now {
+                    std::thread::sleep(pacing.next_shard - now);
+                }
+                pacing.next_shard +=
+                    Duration::from_secs_f32(shard_view.len() as f32 * 8.0 / pacing.bits_per_sec);
+            }
+
             self.inner.send(shard_view)?;
         }
 
         Ok(())
+    }
+
+    fn set_pacing(&mut self, stream_id: u16, bits_per_sec: Option<f32>) {
+        match bits_per_sec {
+            Some(rate) => {
+                self.pacing
+                    .entry(stream_id)
+                    .and_modify(|p| p.bits_per_sec = rate)
+                    .or_insert(Pacing {
+                        bits_per_sec: rate,
+                        next_shard: std::time::Instant::now(),
+                    });
+            }
+            None => {
+                self.pacing.remove(&stream_id);
+            }
+        }
+    }
+
+    fn set_send_buffer_size(&mut self, bytes: usize) -> Result<usize> {
+        let socket = socket2::SockRef::from(&self.inner);
+        socket.set_send_buffer_size(bytes)?;
+
+        Ok(socket.send_buffer_size()?)
     }
 }
 
@@ -256,6 +304,7 @@ pub fn split_multiplexed(
     let writer = MultiplexedUdpWriter {
         inner: socket.try_clone()?,
         max_packet_size,
+        pacing: HashMap::new(),
     };
 
     let reader = MultiplexedUdpReader {

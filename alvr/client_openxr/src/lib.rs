@@ -25,7 +25,21 @@ use interaction::{InteractionContext, InteractionSourcesConfig};
 use lobby::Lobby;
 use openxr as xr;
 use passthrough::PassthroughLayer;
-use std::{ffi::CStr, path::Path, rc::Rc, sync::Arc, thread, time::Duration};
+use std::{
+    ffi::CStr,
+    path::Path,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
+
+// Set by the stream input thread when the user holds the left menu button to quit.
+// Once set, the session is exited and the app finishes instead of re-creating a session.
+pub static APP_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 use stream::StreamContext;
 
 fn from_xr_vec3(v: xr::Vector3f) -> Vec3 {
@@ -158,6 +172,9 @@ fn create_session(
 }
 
 pub fn entry_point() {
+    // Android may keep the process (and this static) alive after Activity.finish();
+    // a relaunch must start with a clear exit request.
+    APP_EXIT_REQUESTED.store(false, Ordering::Relaxed);
     alvr_client_core::init_logging();
 
     const LEGACY_OPENXR_VERSION: xr::Version = xr::Version::new(1, 0, 34);
@@ -279,7 +296,7 @@ pub fn entry_point() {
 
     let graphics_context = Rc::new(GraphicsContext::new_gl());
 
-    let mut last_lobby_message = String::new();
+    let mut last_lobby_message = String::from("INTEL XR DIAGNOSTIC\n01 CLIENT STARTED");
 
     'session_loop: loop {
         let xr_system = xr_instance
@@ -385,14 +402,33 @@ pub fn entry_point() {
 
         let mut event_storage = xr::EventDataBuffer::new();
         let mut headset_is_worn = true;
+        let mut exit_session_requested = false;
         'render_loop: loop {
+            if session_running
+                && !exit_session_requested
+                && APP_EXIT_REQUESTED.load(Ordering::Relaxed)
+            {
+                info!("[INTEL-XR-EXIT] REQUEST_EXIT_SESSION");
+                xr_session.request_exit().ok();
+                exit_session_requested = true;
+            }
+
             while let Some(event) = xr_instance.poll_event(&mut event_storage).unwrap() {
                 match event {
                     xr::Event::EventsLost(event) => {
                         error!("OpenXR: lost {} events!", event.lost_event_count());
                     }
-                    xr::Event::InstanceLossPending(_) => break 'session_loop,
-                    xr::Event::SessionStateChanged(event) => match event.state() {
+                    xr::Event::InstanceLossPending(_) => {
+                        info!("[INTEL-XR-LIFECYCLE] INSTANCE_LOSS_PENDING");
+                        break 'session_loop;
+                    },
+                    xr::Event::SessionStateChanged(event) => {
+                        let state = event.state();
+                        info!("[INTEL-XR-LIFECYCLE] OPENXR_STATE {state:?}");
+                        let hud = format!("INTEL XR DIAGNOSTIC\nOPENXR {state:?}");
+                        last_lobby_message.clone_from(&hud);
+                        lobby.update_hud_message(&hud);
+                        match state {
                         xr::SessionState::READY => {
                             xr_session
                                 .begin(xr::ViewConfigurationType::PRIMARY_STEREO)
@@ -414,9 +450,14 @@ pub fn entry_point() {
                             xr_session.end().ok();
                         }
                         xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
+                            if APP_EXIT_REQUESTED.load(Ordering::Relaxed) {
+                                info!("[INTEL-XR-EXIT] SESSION_EXITED_QUIT_APP");
+                                break 'session_loop;
+                            }
                             break 'render_loop;
                         }
                         _ => (),
+                        }
                     },
                     xr::Event::ReferenceSpaceChangePending(event) => {
                         info!(
@@ -465,6 +506,9 @@ pub fn entry_point() {
                         lobby.update_hud_message(&message);
                     }
                     ClientCoreEvent::StreamingStarted(config) => {
+                        info!("[INTEL-XR-VIDEO] STREAMING_STARTED");
+                        last_lobby_message = String::from("INTEL XR DIAGNOSTIC\n04 STREAM STARTED");
+                        lobby.update_hud_message(&last_lobby_message);
                         let config = ParsedStreamConfig::new(&config);
 
                         let context = StreamContext::new(
@@ -484,6 +528,9 @@ pub fn entry_point() {
                         core_context.send_proximity_state(headset_is_worn);
                     }
                     ClientCoreEvent::StreamingStopped => {
+                        info!("[INTEL-XR-VIDEO] STREAMING_STOPPED");
+                        last_lobby_message = String::from("INTEL XR DIAGNOSTIC\nSTREAM STOPPED");
+                        lobby.update_hud_message(&last_lobby_message);
                         if passthrough_layer.is_none() {
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
                         }
@@ -516,6 +563,9 @@ pub fn entry_point() {
                             .unwrap();
                     }
                     ClientCoreEvent::DecoderConfig { codec, config_nal } => {
+                        info!("[INTEL-XR-VIDEO] DECODER_CONFIG codec={codec:?} bytes={}", config_nal.len());
+                        last_lobby_message = format!("INTEL XR DIAGNOSTIC\n05 DECODER CONFIG\n{codec:?} {} bytes", config_nal.len());
+                        lobby.update_hud_message(&last_lobby_message);
                         if let Some(stream) = &mut stream_context {
                             stream.maybe_initialize_decoder(codec, config_nal);
                         }
@@ -578,8 +628,23 @@ pub fn entry_point() {
                 continue;
             }
 
+            // Diagnostic escape hatch: the PC test can create this marker over ADB when its
+            // unattended capture is complete. Render the lobby HUD so the wearer knows it is
+            // safe to remove the headset without contaminating the test with a DOFF event.
+            #[cfg(target_os = "android")]
+            let diagnostic_done = std::path::Path::new("/sdcard/intel-xr-diagnostic.done").exists();
+            #[cfg(not(target_os = "android"))]
+            let diagnostic_done = false;
+
+            if diagnostic_done {
+                last_lobby_message = String::from("INTEL XR DIAGNOSTIC\nTEST COMPLETE\nYOU MAY REMOVE HEADSET");
+                lobby.update_hud_message(&last_lobby_message);
+            }
+
             // todo: allow rendering lobby and stream layers at the same time and add cross fade
-            let (layer, display_time) = if let Some(stream) = &mut stream_context {
+            let (layer, display_time) = if diagnostic_done {
+                (lobby.render(vsync_time), vsync_time)
+            } else if let Some(stream) = &mut stream_context {
                 stream.render(frame_interval, vsync_time)
             } else {
                 (lobby.render(vsync_time), vsync_time)
@@ -628,6 +693,20 @@ fn xr_runtime_now(xr_instance: &xr::Instance) -> Option<xr::Time> {
 }
 
 #[cfg(target_os = "android")]
+fn finish_activity() {
+    let context = ndk_context::android_context();
+    let vm = unsafe { jni::JavaVM::from_raw(context.vm().cast()) }.unwrap();
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return;
+    };
+    // The NativeActivity global reference is owned by the runtime; do not delete it.
+    let activity = unsafe { jni::objects::JObject::from_raw(context.context().cast()) };
+    if env.call_method(&activity, "finish", "()V", &[]).is_err() {
+        error!("[INTEL-XR-EXIT] Activity.finish() failed");
+    }
+}
+
+#[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(app: android_activity::AndroidApp) {
     use android_activity::{InputStatus, MainEvent, PollEvent};
@@ -645,7 +724,13 @@ fn android_main(app: android_activity::AndroidApp) {
     });
 
     let mut should_quit = false;
+    let mut finish_requested = false;
     while !should_quit {
+        // The render thread returns when the user quit from inside the app: close the activity.
+        if !finish_requested && rendering_thread.is_finished() {
+            finish_requested = true;
+            finish_activity();
+        }
         app.poll_events(Some(Duration::from_millis(100)), |event| match event {
             PollEvent::Main(MainEvent::Destroy) => {
                 should_quit = true;
@@ -661,4 +746,11 @@ fn android_main(app: android_activity::AndroidApp) {
 
     // Note: the quit event is sent from OpenXR too, this will return rather quicly.
     rendering_thread.join().unwrap();
+
+    // After an in-app exit Android may keep this process cached and reuse it on the next
+    // launch, where the client would not start again. End the process so relaunch is fresh.
+    if finish_requested {
+        info!("[INTEL-XR-EXIT] PROCESS_EXIT");
+        std::process::exit(0);
+    }
 }

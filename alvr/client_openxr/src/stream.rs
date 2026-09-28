@@ -8,14 +8,14 @@ use alvr_client_core::{
 };
 use alvr_common::{
     AlvrFoveatedEncodingParams, DETACHED_CONTROLLER_LEFT_ID, DETACHED_CONTROLLER_RIGHT_ID,
-    HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose, RelaxedAtomic, ViewParams,
+    HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, LEFT_MENU_CLICK_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::Result,
-    error,
+    error, info,
     glam::{UVec2, Vec2},
     parking_lot::RwLock,
 };
 use alvr_graphics::{GraphicsContext, StreamRenderer, StreamViewParams};
-use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
+use alvr_packets::{ButtonValue, ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
     MediacodecProperty, PassthroughMode, UpscalingConfig,
@@ -95,6 +95,8 @@ pub struct StreamContext {
     renderer: StreamRenderer,
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     use_custom_reprojection: bool,
+    intel_xr_waiting_frame_logged: bool,
+    intel_xr_first_frame_logged: bool,
 }
 
 impl StreamContext {
@@ -241,6 +243,8 @@ impl StreamContext {
             target_view_resolution,
             renderer,
             decoder: None,
+            intel_xr_waiting_frame_logged: false,
+            intel_xr_first_frame_logged: false,
         };
 
         this.update_reference_space();
@@ -300,6 +304,7 @@ impl StreamContext {
     }
 
     pub fn maybe_initialize_decoder(&mut self, codec: CodecType, config_nal: Vec<u8>) {
+        info!("[INTEL-XR-VIDEO] DECODER_CREATE_BEGIN codec={codec:?} config_bytes={}", config_nal.len());
         let new_config = VideoDecoderConfig {
             codec,
             force_software_decoder: self.config.force_software_decoder,
@@ -323,10 +328,17 @@ impl StreamContext {
                     Err(e) => ctx.report_fatal_decoder_error(&e.to_string()),
                 }
             });
+            info!("[INTEL-XR-VIDEO] DECODER_CREATED");
             self.decoder = Some((config, source));
 
             self.core_context.set_decoder_input_callback(Box::new(
-                move |timestamp, buffer| -> bool { sink.push_nal(timestamp, buffer) },
+                move |timestamp, buffer| -> bool {
+                    let accepted = sink.push_nal(timestamp, buffer);
+                    if accepted {
+                        info!("[INTEL-XR-VIDEO] DECODER_INPUT bytes={} timestamp_ns={}", buffer.len(), timestamp.as_nanos());
+                    }
+                    accepted
+                },
             ));
         }
     }
@@ -356,6 +368,7 @@ impl StreamContext {
 
         let (timestamp, frame_metadata, buffer_ptr) =
             if let Some((timestamp, buffer_ptr)) = frame_result {
+                info!("[INTEL-XR-VIDEO] DECODER_OUTPUT timestamp_ns={} buffer={buffer_ptr:p}", timestamp.as_nanos());
                 if let Some(metadata) = self.core_context.report_compositor_start(timestamp) {
                     self.last_good_video_frame_metadata = VideoFrameMetadata {
                         foveation_center_shifts: metadata
@@ -430,6 +443,15 @@ impl StreamContext {
             openxr_display_time = vsync_time;
         }
 
+        if buffer_ptr.is_null() {
+            if !self.intel_xr_waiting_frame_logged {
+                info!("[INTEL-XR-VIDEO] STREAM_RENDER waiting_for_first_decoded_frame");
+                self.intel_xr_waiting_frame_logged = true;
+            }
+        } else if !self.intel_xr_first_frame_logged {
+            info!("[INTEL-XR-VIDEO] STREAM_RENDER first_decoded_frame");
+            self.intel_xr_first_frame_logged = true;
+        }
         self.renderer.render(
             buffer_ptr,
             [
@@ -526,6 +548,8 @@ impl Drop for StreamContext {
     }
 }
 
+const EXIT_MENU_HOLD: Duration = Duration::from_secs(2);
+
 fn stream_input_loop(
     core_ctx: &ClientCoreContext,
     xr_session: xr::Session<xr::OpenGlEs>,
@@ -540,6 +564,7 @@ fn stream_input_loop(
     let mut last_view_params = [ViewParams::DUMMY; 2];
 
     let mut deadline = Instant::now();
+    let mut menu_hold_start: Option<Instant> = None;
     let frame_interval = Duration::from_secs_f32(1.0 / refresh_rate);
     while running.value() {
         let int_ctx_lock = interaction_ctx.read();
@@ -664,6 +689,19 @@ fn stream_input_loop(
 
         let button_entries =
             interaction::update_buttons(&xr_session, &interaction_ctx.read().button_actions);
+        // Hold the left menu button to quit the app from inside the headset.
+        for entry in &button_entries {
+            if entry.path_id == *LEFT_MENU_CLICK_ID
+                && let ButtonValue::Binary(pressed) = entry.value
+            {
+                menu_hold_start = pressed.then(Instant::now);
+            }
+        }
+        if menu_hold_start.is_some_and(|start| start.elapsed() >= EXIT_MENU_HOLD)
+            && !crate::APP_EXIT_REQUESTED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            info!("[INTEL-XR-EXIT] MENU_HOLD_EXIT");
+        }
         if !button_entries.is_empty() {
             core_ctx.send_buttons(button_entries);
         }

@@ -8,6 +8,7 @@ use crate::{
 use alvr_common::{
     AlvrCodecType, AlvrFoveatedEncodingParams, AlvrPose, AlvrQuat, AlvrViewParams, log,
     parking_lot::{Mutex, RwLock},
+    HEAD_ID, HAND_LEFT_ID, HAND_RIGHT_ID,
 };
 use alvr_packets::{ButtonEntry, ButtonValue, Haptics};
 use alvr_session::CodecType;
@@ -17,7 +18,8 @@ use std::{
     path::PathBuf,
     ptr,
     str::FromStr,
-    sync::{LazyLock, mpsc},
+    sync::{
+        atomic::{AtomicBool, Ordering},LazyLock, mpsc},
     time::{Duration, Instant},
 };
 
@@ -33,6 +35,13 @@ pub struct AlvrDeviceMotion {
     pub angular_velocity: [f32; 3],
 }
 
+#[repr(C)]
+pub struct AlvrDeviceIds {
+    pub head: u64,
+    pub hand_left: u64,
+    pub hand_right: u64,
+}
+
 #[repr(u8)]
 pub enum AlvrHandType {
     Left = 0,
@@ -41,8 +50,9 @@ pub enum AlvrHandType {
 
 #[repr(C)]
 pub union AlvrButtonValue {
-    pub binary: bool,
-    pub scalar: f32,
+    // Monado-line C ABI names (alvr_render and the Monado controller driver use them).
+    pub scalar: bool,
+    pub floatp: f32,
 }
 
 // the profile is implied
@@ -135,6 +145,15 @@ pub extern "C" fn alvr_get_time_ns() -> u64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alvr_path_to_id(path_string: *const c_char) -> u64 {
     alvr_common::hash_string(unsafe { CStr::from_ptr(path_string) }.to_str().unwrap())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alvr_get_ids() -> AlvrDeviceIds {
+    AlvrDeviceIds {
+        head: *HEAD_ID,
+        hand_left: *HAND_LEFT_ID,
+        hand_right: *HAND_RIGHT_ID,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -420,8 +439,8 @@ pub unsafe extern "C" fn alvr_get_buttons(out_entries: *mut AlvrButtonEntry) -> 
             let out_entry = unsafe { &mut *out_entries.add(i) };
             out_entry.id = entry.path_id;
             match entry.value {
-                ButtonValue::Binary(value) => out_entry.value.binary = value,
-                ButtonValue::Scalar(value) => out_entry.value.scalar = value,
+                ButtonValue::Binary(value) => out_entry.value.scalar = value,
+                ButtonValue::Scalar(value) => out_entry.value.floatp = value,
             }
         }
 
@@ -520,7 +539,31 @@ pub unsafe extern "C" fn alvr_send_video_nal(
     buffer_ptr: *mut u8,
     len: i32,
 ) {
-    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+    static INTEL_XR_CAPI_VIDEO_ENTER_LOGGED: AtomicBool = AtomicBool::new(false);
+    let first_probe = !INTEL_XR_CAPI_VIDEO_ENTER_LOGGED.swap(true, Ordering::SeqCst);
+    if first_probe {
+        eprintln!("[INTEL-XR-CAPI-RAW] ENTER len={} idr={}", len, is_idr);
+    }
+
+    let context_lock = SERVER_CORE_CONTEXT.read();
+    let context_present = context_lock.is_some();
+    if first_probe {
+        eprintln!(
+            "[INTEL-XR-CAPI-RAW] CONTEXT_PRESENT={}",
+            context_present
+        );
+        alvr_common::info!(
+            "[INTEL-XR-SERVER] CAPI_VIDEO_NAL_ENTER len={} idr={} context_present={}",
+            len,
+            is_idr,
+            context_present
+        );
+    }
+
+    if let Some(context) = &*context_lock {
+        if first_probe {
+            eprintln!("[INTEL-XR-CAPI-RAW] DISPATCH_SERVER_CORE");
+        }
         let buffer = unsafe { std::slice::from_raw_parts(buffer_ptr, len as usize) };
 
         let global_view_params = unsafe {
@@ -538,6 +581,11 @@ pub unsafe extern "C" fn alvr_send_video_nal(
             is_idr,
             buffer.to_vec(),
         );
+        if first_probe {
+            eprintln!("[INTEL-XR-CAPI-RAW] RETURN_SERVER_CORE");
+        }
+    } else if first_probe {
+        eprintln!("[INTEL-XR-CAPI-RAW] DROP_NO_SERVER_CORE_CONTEXT");
     }
 }
 
