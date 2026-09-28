@@ -137,10 +137,16 @@ impl ProtoControlSocket {
     pub fn connect_to(timeout: Duration, peer: PeerType<'_>) -> ConResult<(Self, IpAddr)> {
         let socket = match peer {
             PeerType::AnyClient(ips) => {
+                // Wired clients are reached through a local ADB forward (per-instance port).
+                let port = if !ips.is_empty() && ips.iter().all(|ip| ip.is_loopback()) {
+                    crate::wired_control_port()
+                } else {
+                    CONTROL_PORT
+                };
                 tcp::connect_to_client(
                     timeout,
                     &ips,
-                    CONTROL_PORT,
+                    port,
                     SocketBufferSize::Default,
                     SocketBufferSize::Default,
                 )?

@@ -15,6 +15,20 @@ pub use stream_socket::*;
 
 pub const LOCAL_IP: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 pub const CONTROL_PORT: u16 = 9943;
+
+/// Local PC port for the wired (ADB-forwarded) control connection. Several runtime instances on
+/// one PC (one per headset) each set ALVR_WIRED_PORT_OFFSET so their forwards do not collide;
+/// the headset side always listens on CONTROL_PORT.
+pub fn wired_control_port() -> u16 {
+    static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *PORT.get_or_init(|| {
+        let offset = std::env::var("ALVR_WIRED_PORT_OFFSET")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(0);
+        CONTROL_PORT.saturating_add(offset)
+    })
+}
 pub const HANDSHAKE_PACKET_SIZE_BYTES: usize = 56; // this may change in future protocols
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(2);

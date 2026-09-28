@@ -318,20 +318,20 @@ pub fn list_forwarded_ports(adb_path: &str, device_serial: &str) -> Result<Vec<F
     Ok(forwarded_ports)
 }
 
-pub fn forward_port(adb_path: &str, device_serial: &str, port: u16) -> Result<()> {
+pub fn forward_port(adb_path: &str, device_serial: &str, local: u16, remote: u16) -> Result<()> {
     get_command(
         adb_path,
         &[
             "-s",
             device_serial,
             "forward",
-            &format!("tcp:{port}"),
-            &format!("tcp:{port}"),
+            &format!("tcp:{local}"),
+            &format!("tcp:{remote}"),
         ],
     )
     .output()
     .context(format!(
-        "Failed to forward port {port:?} of device {device_serial:?}"
+        "Failed to forward port {local} -> {remote} of device {device_serial:?}"
     ))?;
 
     Ok(())

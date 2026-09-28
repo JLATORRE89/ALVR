@@ -314,7 +314,7 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
                 }
 
                 let status = match wired_connection.setup(
-                    CONTROL_PORT,
+                    (alvr_sockets::wired_control_port(), CONTROL_PORT),
                     stream_port,
                     &client_type,
                     client_autolaunch,

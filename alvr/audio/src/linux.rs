@@ -199,6 +199,15 @@ fn pw_main_loop(
     Ok(())
 }
 
+/// PipeWire node name, suffixed with ALVR_INSTANCE_NAME when several runtime instances (one per
+/// headset) share this PC, e.g. "ALVR Microphone (quest-b)". Voice routing links these by name.
+fn node_name(base: &str) -> String {
+    match std::env::var("ALVR_INSTANCE_NAME") {
+        Ok(name) if !name.is_empty() => format!("{base} ({name})"),
+        _ => base.to_owned(),
+    }
+}
+
 fn audio_info_to_vec(audio_info: AudioInfoRaw) -> Vec<u8> {
     PodSerializer::serialize(
         io::Cursor::new(Vec::new()),
@@ -223,7 +232,7 @@ fn create_speaker_stream(
         pw_core,
         "alvr-audio",
         properties::properties! {
-            *keys::NODE_NAME => "ALVR Audio",
+            *keys::NODE_NAME => node_name("ALVR Audio").as_str(),
             *keys::MEDIA_NAME => "alvr-audio",
             *keys::MEDIA_TYPE => "Audio",
             *keys::MEDIA_CATEGORY => "Capture",
@@ -278,7 +287,7 @@ fn create_mic_stream(
         pw_core,
         "alvr-mic",
         properties::properties! {
-            *keys::NODE_NAME => "ALVR Microphone",
+            *keys::NODE_NAME => node_name("ALVR Microphone").as_str(),
             *keys::MEDIA_NAME => "alvr-mic",
             *keys::MEDIA_TYPE => "Audio",
             *keys::MEDIA_CATEGORY => "Playback",
