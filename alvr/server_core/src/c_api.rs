@@ -348,6 +348,84 @@ pub unsafe extern "C" fn alvr_get_device_motion(
     }
 }
 
+// Match the OpenVR HMD path: predict once to photon time, then submit a pose
+// without velocity so the receiving runtime cannot extrapolate it a second time.
+fn head_motion_for_display(motion: alvr_common::DeviceMotion, latency: Duration) -> AlvrDeviceMotion {
+    let predicted = motion.predict(Duration::ZERO, latency);
+    AlvrDeviceMotion {
+        pose: alvr_common::to_capi_pose(&predicted.pose),
+        linear_velocity: [0.0; 3],
+        angular_velocity: [0.0; 3],
+    }
+}
+
+/// Returns the head pose predicted to display time using measured, configured-cap-bounded
+/// motion-to-photon latency. Output velocities are zero: this pose is already predicted.
+/// Raw tracking timestamps remain unchanged for matching video/statistics.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn alvr_get_head_motion_for_display(
+    sample_timestamp_ns: u64,
+    out_motion: *mut AlvrDeviceMotion,
+) -> bool {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read()
+        && let Some(motion) = context.get_device_motion(*HEAD_ID, Duration::from_nanos(sample_timestamp_ns))
+    {
+        let latency = context.get_motion_to_photon_latency();
+        unsafe { *out_motion = head_motion_for_display(motion, latency); }
+        static REPORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if REPORT.fetch_add(1, Ordering::Relaxed) % 1080 == 0 {
+            eprintln!("[INTEL-XR-TRACKING] HEAD_DISPLAY_PREDICTION sample_ns={} latency_ms={:.3} yaw_rate_rad_s={:.4}",
+                      sample_timestamp_ns, latency.as_secs_f64() * 1000.0, motion.angular_velocity.y);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod head_prediction_tests {
+    use super::*;
+    use alvr_common::{DeviceMotion, glam::{Quat, Vec3}};
+
+    #[test]
+    fn yaw_prediction_covers_both_turn_directions_without_double_prediction() {
+        for direction in [-1.0_f32, 1.0] {
+            let motion = DeviceMotion {
+                angular_velocity: Vec3::Y * direction, // 1 radian/s
+                ..DeviceMotion::IDENTITY
+            };
+            let predicted = head_motion_for_display(motion, Duration::from_millis(60));
+            let q = predicted.pose.orientation;
+            let actual = Quat::from_xyzw(q.x, q.y, q.z, q.w);
+            let display_orientation = Quat::from_rotation_y(direction * 0.060);
+            assert!(actual.angle_between(display_orientation) < 0.0001);
+            // The old unpredicted path leaves 3.44 degrees of missing edge coverage
+            // after display-time reprojection of the same-FOV image.
+            assert!(motion.pose.orientation.angle_between(display_orientation) > 0.059);
+            assert_eq!(predicted.angular_velocity, [0.0; 3]);
+            assert_eq!(predicted.linear_velocity, [0.0; 3]);
+        }
+    }
+
+    #[test]
+    fn startup_without_latency_keeps_pose_and_prediction_uses_world_velocity() {
+        let motion = DeviceMotion {
+            pose: alvr_common::Pose { orientation: Quat::from_rotation_x(0.4), position: Vec3::new(1.0, 2.0, 3.0) },
+            angular_velocity: Vec3::Y,
+            linear_velocity: Vec3::X,
+        };
+        let initial = head_motion_for_display(motion, Duration::ZERO);
+        assert_eq!(initial.pose.position, [1.0, 2.0, 3.0]);
+        let p = head_motion_for_display(motion, Duration::from_millis(50));
+        assert!((p.pose.position[0] - 1.05).abs() < 1e-6);
+        let q = p.pose.orientation;
+        let actual = Quat::from_xyzw(q.x, q.y, q.z, q.w);
+        let expected = Quat::from_rotation_y(0.05) * Quat::from_rotation_x(0.4);
+        assert!(actual.angle_between(expected) < 0.0001);
+    }
+}
+
 /// out_skeleton must be an array of length 26
 /// Returns false if there is no tracking sample for the requested sample timestamp
 #[unsafe(no_mangle)]
