@@ -2,7 +2,7 @@ pub mod commands;
 mod parse;
 
 use alvr_common::anyhow::Result;
-use alvr_common::{dbg_connection, error, warn};
+use alvr_common::{dbg_connection, warn};
 use alvr_session::WiredClientAutoLaunchConfig;
 use alvr_system_info::{
     ClientFlavor, PACKAGE_NAME_GITHUB_DEV, PACKAGE_NAME_GITHUB_STABLE, PACKAGE_NAME_STORE,
@@ -110,12 +110,27 @@ impl WiredConnection {
     }
 }
 
-impl Drop for WiredConnection {
-    fn drop(&mut self) {
-        dbg_connection!("wired_connection: Killing ADB server");
-        if let Err(e) = commands::kill_server(&self.adb_path) {
-            error!("{e:?}");
-        }
+// ADB is a shared host service used by the panel, tablets and other runtime instances.
+// Dropping this connection must not kill it or remove other clients' forwards.
+// Our forwarding setup is idempotent and checks the owning device on the next connection.
+
+#[cfg(all(test, unix))]
+mod lifecycle_tests {
+    use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    #[test]
+    fn dropping_wired_connection_does_not_execute_adb() {
+        let dir = std::env::temp_dir().join(format!("alvr-adb-drop-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let adb = dir.join("adb");
+        let marker = dir.join("called");
+        fs::write(&adb, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        fs::set_permissions(&adb, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(WiredConnection { adb_path: adb.to_string_lossy().into_owned() });
+        let executed = marker.exists();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!executed, "connection teardown must leave the shared ADB server alive");
     }
 }
 
